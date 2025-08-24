@@ -20,8 +20,6 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
 # --- Bot Configuration ---
 TIP_ADDRESS = "0x50A0d7Fb9f64e908688443cB94c3971705599d79"
-# The maximum number of simultaneous RPC requests the bot will make.
-# This is the key to preventing rate-limiting errors.
 MAX_CONCURRENT_REQUESTS = 20
 
 # --- Chain & Token Configuration ---
@@ -105,7 +103,6 @@ async def get_all_asset_balances(session: aiohttp.ClientSession, addresses: List
     
     results = await asyncio.gather(*tasks)
     
-    # Aggregate results
     aggregated = {}
     for chain_id, symbol, balance in results:
         if balance and balance > 0.000001:
@@ -141,12 +138,13 @@ async def parse_and_resolve_addresses(session: aiohttp.ClientSession, text: str)
 # --- Command Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    image_url = "https://i.ibb.co/qMZjmJ9V/eth2.png"
-    welcome_message = f"[​]({image_url})"
+    # IMPORTANT: Replace the URL below with a direct link to your image.
+    image_url = "https://i.imgur.com/example.png"  # <--- REPLACE THIS WITH YOUR IMAGE URL
+    welcome_message = f"[​]({image_url})" # Zero-width space trick for image preview
     welcome_message += """
-    🤖 **Crypto Balance Bot**
+🤖 **Crypto Balance Bot**
 
-I'll help you check native and stablecoin balances across multiple EVM chains. I also resolve `.eth` names.
+I can help you check native and stablecoin balances across multiple EVM chains! I also resolve `.eth` names.
 
 **Commands:**
 /start - Show this help message
@@ -157,6 +155,7 @@ I'll help you check native and stablecoin balances across multiple EVM chains. I
 • Base
 • Ink
 • Arbitrum
+• Abstract
 • Hyperliquid
 • Unichain
 • Polygon
@@ -166,19 +165,25 @@ I'll help you check native and stablecoin balances across multiple EVM chains. I
 **Usage:**
 1. Paste your wallet addresses or `.eth` names.
 2. You can paste up to 200.
-3. I'll find all native and stablecoin balances across all supported chains and return a summary.
+3. I'll find all native and stablecoin balances across all supported chains.
 
 **Example:**
 0x742d35Cc6634C0532925a3b8D5C9E49C7F59c2c4
 vitalik.eth
-""" 
+"""
     await update.message.reply_text(welcome_message, parse_mode='Markdown', disable_web_page_preview=False)
 
 async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    about_message = f"Tip Jar (ETH/EVM):\n`{TIP_ADDRESS}`"
+    about_message = f"""
+This bot was created to easily track balances across multiple wallets and chains.
+If you find it useful, please consider supporting its hosting costs. Tips are greatly appreciated!
+
+**Tip Jar (ETH/EVM):**
+`{TIP_ADDRESS}`
+    """
     await update.message.reply_text(about_message, parse_mode='Markdown')
 
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_T YPE):
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_message = await update.message.reply_text("🔍 Resolving addresses...")
     async with aiohttp.ClientSession() as session:
         addresses = await parse_and_resolve_addresses(session, update.message.text)
@@ -192,10 +197,8 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_T YPE):
     if not aggregated_balances:
         await status_message.edit_text("No balances found for the provided addresses."); return
 
-    # --- New Display Logic ---
     grand_totals = {}
     
-    # First, calculate all grand totals
     for chain_id, tokens in aggregated_balances.items():
         for symbol, balance in tokens.items():
             if symbol not in grand_totals: grand_totals[symbol] = 0
@@ -203,7 +206,6 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_T YPE):
 
     final_message = "📊 **Balance Summary for {} addresses:**\n\n".format(len(addresses))
 
-    # Then, create the per-chain breakdown
     for chain_id, tokens in sorted(aggregated_balances.items()):
         chain_name = CHAINS[chain_id]['name']
         token_lines = []
