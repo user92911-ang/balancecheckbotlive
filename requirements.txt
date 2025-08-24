@@ -1,3 +1,4 @@
-﻿python-telegram-bot
+python-telegram-bot
 aiohttp
-
+fastapi
+uvicorn
