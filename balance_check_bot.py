@@ -4,6 +4,8 @@ import os
 import re
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from collections import defaultdict
 
 import aiohttp
 from fastapi import FastAPI
@@ -20,38 +22,100 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
 # --- Bot Configuration ---
 TIP_ADDRESS = "0x50A0d7Fb9f64e908688443cB94c3971705599d79"
-MAX_CONCURRENT_REQUESTS = 5  # Much lower to avoid rate limits
-REQUEST_TIMEOUT = 12  # Shorter timeout
-MAX_RETRIES = 1  # Only 1 retry to fail fast
-RETRY_DELAY = 0.3  # Faster retry
-REQUEST_DELAY = 0.2  # Longer delay between requests
+MAX_CONCURRENT_REQUESTS = 20  # Increased for better parallelism
+REQUEST_TIMEOUT = 8  # Reduced timeout
+MAX_RETRIES = 2  # Reduced retries
+BATCH_SIZE = 10  # For batch RPC calls
 
 # Precomputed decimals to avoid extra RPC calls
 TOKEN_DECIMALS = {
-    'USDT': 6,  # Most USDT tokens use 6 decimals
-    'USDC': 6,  # Most USDC tokens use 6 decimals
+    'USDT': 6,
+    'USDC': 6,
 }
 
-# --- Chain & Token Configuration with RPC Fallbacks ---
+@dataclass
+class BalanceCheck:
+    chain_id: str
+    address: str
+    symbol: str
+    contract: Optional[str] = None
+    is_native: bool = True
+
+# --- Enhanced Chain Configuration with Faster RPCs First ---
 CHAINS = {
-    'ethereum': {'name': 'Ethereum Mainnet', 'symbol': 'ETH', 'rpcs': ['https://eth.llamarpc.com', 'https://ethereum.publicnode.com']},
-    'base': {'name': 'Base', 'symbol': 'ETH', 'rpcs': ['https://base.publicnode.com', 'https://base-mainnet.public.blastapi.io']},  # Removed rate-limited RPC first
-    'arbitrum': {'name': 'Arbitrum', 'symbol': 'ETH', 'rpcs': ['https://arbitrum.publicnode.com', 'https://arb1.arbitrum.io/rpc']},
-    'optimism': {'name': 'Optimism', 'symbol': 'ETH', 'rpcs': ['https://optimism.publicnode.com', 'https://mainnet.optimism.io']},
-    'polygon': {'name': 'Polygon', 'symbol': 'MATIC', 'rpcs': ['https://polygon.publicnode.com', 'https://polygon-rpc.com']},
-    'bsc': {'name': 'BSC', 'symbol': 'BNB', 'rpcs': ['https://bnb.publicnode.com', 'https://bsc-dataseed.binance.org']},
-    'ink': {'name': 'Ink', 'symbol': 'ETH', 'rpcs': ['https://rpc-gel.inkonchain.com']},
-    # 'hyperliquid': {'name': 'Hyperliquid', 'symbol': 'ETH', 'rpcs': ['https://rpc.hyperliquid.xyz/evm']},  # Disable problematic chain
-    'unichain': {'name': 'Unichain', 'symbol': 'ETH', 'rpcs': ['https://mainnet.unichain.org']},
-    # 'abstract': {'name': 'Abstract', 'symbol': 'ETH', 'rpcs': ['https://api.mainnet.abs.xyz']},  # Also rate limiting heavily
+    'ethereum': {
+        'name': 'Ethereum Mainnet', 
+        'symbol': 'ETH', 
+        'rpcs': [
+            'https://eth.llamarpc.com',
+            'https://rpc.ankr.com/eth',
+            'https://ethereum.publicnode.com'
+        ]
+    },
+    'base': {
+        'name': 'Base', 
+        'symbol': 'ETH', 
+        'rpcs': [
+            'https://mainnet.base.org',
+            'https://base.publicnode.com',
+            'https://base-mainnet.public.blastapi.io'
+        ]
+    },
+    'arbitrum': {
+        'name': 'Arbitrum', 
+        'symbol': 'ETH', 
+        'rpcs': [
+            'https://arb1.arbitrum.io/rpc',
+            'https://rpc.ankr.com/arbitrum',
+            'https://arbitrum.publicnode.com'
+        ]
+    },
+    'optimism': {
+        'name': 'Optimism', 
+        'symbol': 'ETH', 
+        'rpcs': [
+            'https://mainnet.optimism.io',
+            'https://rpc.ankr.com/optimism',
+            'https://optimism.publicnode.com'
+        ]
+    },
+    'polygon': {
+        'name': 'Polygon', 
+        'symbol': 'MATIC', 
+        'rpcs': [
+            'https://polygon-rpc.com',
+            'https://rpc.ankr.com/polygon',
+            'https://polygon.publicnode.com'
+        ]
+    },
+    'bsc': {
+        'name': 'BSC', 
+        'symbol': 'BNB', 
+        'rpcs': [
+            'https://bsc-dataseed.binance.org',
+            'https://rpc.ankr.com/bsc',
+            'https://bnb.publicnode.com'
+        ]
+    },
+    'ink': {
+        'name': 'Ink', 
+        'symbol': 'ETH', 
+        'rpcs': ['https://rpc-gel.inkonchain.com']
+    },
+    'unichain': {
+        'name': 'Unichain', 
+        'symbol': 'ETH', 
+        'rpcs': ['https://mainnet.unichain.org']
+    },
 }
 
 ERC20_CONTRACTS = {
     'ethereum': {'USDT': '0xdac17f958d2ee523a2206206994597c13d831ec7', 'USDC': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'},
     'base': {'USDT': '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2', 'USDC': '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'},
     'arbitrum': {'USDC': '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', 'USDT': '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9'},
+    'optimism': {'USDC': '0x0b2c639c533813f4aa9d7837caf62653d097ff85', 'USDT': '0x94b008aa00579c1307b0ef2c499ad98a8ce58e58'},
     'polygon': {'USDC': '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', 'USDT': '0xc2132D05D31c914a87C6611C10748AEb04B58e8F'},
-    'bsc': {'USDT': '0x55d398326f99059ff775485246999027b3197955'},
+    'bsc': {'USDT': '0x55d398326f99059ff775485246999027b3197955', 'USDC': '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d'},
     'ink': {'USDT': '0x0200C29006150606B650577BBE7B6248F58470c1'},
     'unichain': {'USDT': '0x9151434b16b9763660705744891fA906F660EcC5'},
 }
@@ -60,243 +124,226 @@ class BalanceFetchError(Exception):
     """Custom exception for balance fetching errors"""
     pass
 
-# --- Enhanced Balance Fetching Logic with Better Error Handling ---
+# --- Optimized RPC and Balance Fetching ---
 
 async def get_eth_price(session: aiohttp.ClientSession) -> float:
-    """Fetch ETH price from CoinGecko with better error handling"""
+    """Fetch ETH price from CoinGecko"""
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": "ethereum", "vs_currencies": "usd"}
     if COINGECKO_API_KEY:
         params['x_cg_demo_api_key'] = COINGECKO_API_KEY
-    headers = {'User-Agent': 'Mozilla/5.0'}
     
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with session.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    if 'ethereum' in data and 'usd' in data['ethereum']:
-                        price = data['ethereum']['usd']
-                        logger.info(f"Fetched ETH price: ${price}")
-                        return price
-                else:
-                    logger.warning(f"CoinGecko API returned status {r.status}")
-        except Exception as e:
-            logger.warning(f"ETH price fetch attempt {attempt + 1} failed: {e}")
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY)
-    
-    logger.error("Failed to fetch ETH price after all attempts")
+    try:
+        async with session.get(url, params=params, timeout=5) as r:
+            if r.status == 200:
+                data = await r.json()
+                return data.get('ethereum', {}).get('usd', 0.0)
+    except Exception as e:
+        logger.warning(f"ETH price fetch failed: {e}")
     return 0.0
 
-async def make_rpc_call_with_retries(session: aiohttp.ClientSession, rpc_url: str, payload: dict, context: str) -> Optional[dict]:
-    """Make RPC call with aggressive rate limit handling"""
-    for attempt in range(MAX_RETRIES):
+async def make_batch_rpc_call(session: aiohttp.ClientSession, rpc_url: str, 
+                            payloads: List[dict], context: str) -> List[Optional[dict]]:
+    """Make batch RPC call for better efficiency"""
+    if len(payloads) == 1:
+        # Single call
         try:
-            # Add delay to avoid overwhelming RPCs
-            if attempt > 0 or 'balance' in context:
-                await asyncio.sleep(REQUEST_DELAY * (attempt + 1))
-                
-            async with session.post(rpc_url, json=payload, timeout=REQUEST_TIMEOUT) as response:
+            async with session.post(rpc_url, json=payloads[0], timeout=REQUEST_TIMEOUT) as response:
                 if response.status == 200:
                     data = await response.json()
-                    if 'error' in data:
-                        logger.warning(f"RPC error for {context}: {data['error'].get('message', 'Unknown error')}")
-                        return None  # Don't retry on RPC errors
-                    return data
-                elif response.status == 429:  # Rate limited
-                    wait_time = min(5, 2 ** attempt)  # Cap at 5 seconds
-                    logger.warning(f"Rate limited for {context}, skipping (would wait {wait_time}s)")
-                    return None  # Don't wait for rate limits - skip instead
-                else:
-                    logger.warning(f"HTTP {response.status} for {context}")
-                    return None  # Don't retry on other HTTP errors
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout for {context} (attempt {attempt + 1})")
+                    if 'error' not in data:
+                        return [data]
+                elif response.status == 429:
+                    logger.warning(f"Rate limited on {rpc_url} for {context}")
+                    return [None]
         except Exception as e:
-            logger.warning(f"Error for {context} (attempt {attempt + 1}): {e}")
-        
-        # Only retry on timeouts/connection errors, not HTTP errors
-        if attempt < MAX_RETRIES - 1:
-            await asyncio.sleep(RETRY_DELAY)
+            logger.warning(f"RPC call failed for {context}: {e}")
+        return [None]
     
-    return None
+    # Batch call
+    try:
+        async with session.post(rpc_url, json=payloads, timeout=REQUEST_TIMEOUT) as response:
+            if response.status == 200:
+                data = await response.json()
+                if isinstance(data, list):
+                    return [item if 'error' not in item else None for item in data]
+                else:
+                    return [data if 'error' not in data else None]
+            elif response.status == 429:
+                logger.warning(f"Rate limited on {rpc_url} for batch {context}")
+                return [None] * len(payloads)
+    except Exception as e:
+        logger.warning(f"Batch RPC call failed for {context}: {e}")
+    
+    return [None] * len(payloads)
 
-async def get_native_balance_with_fallback(session: aiohttp.ClientSession, rpc_urls: List[str], 
-                                         address: str, chain_id: str, semaphore: asyncio.Semaphore) -> float:
-    """Get native balance with comprehensive fallback and error tracking"""
+async def process_balance_batch(session: aiohttp.ClientSession, 
+                              checks: List[BalanceCheck], 
+                              semaphore: asyncio.Semaphore) -> List[Tuple[str, str, float]]:
+    """Process a batch of balance checks for the same chain"""
+    if not checks:
+        return []
+    
     async with semaphore:
-        context = f"native balance for {address[:6]}...{address[-4:]} on {chain_id}"
+        chain_id = checks[0].chain_id
+        rpc_urls = CHAINS[chain_id]['rpcs']
+        results = []
         
-        for rpc_url in rpc_urls:
-            payload = {
-                "jsonrpc": "2.0",
-                "method": "eth_getBalance",
-                "params": [address, "latest"],
-                "id": 1
-            }
+        # Group by type (native vs ERC20)
+        native_checks = [c for c in checks if c.is_native]
+        erc20_checks = [c for c in checks if not c.is_native]
+        
+        # Process native balances in batch
+        if native_checks:
+            native_payloads = []
+            for i, check in enumerate(native_checks):
+                native_payloads.append({
+                    "jsonrpc": "2.0",
+                    "method": "eth_getBalance",
+                    "params": [check.address, "latest"],
+                    "id": i + 1
+                })
             
-            data = await make_rpc_call_with_retries(session, rpc_url, payload, context)
-            if data and 'result' in data and data['result']:
-                try:
-                    balance = int(data['result'], 16) / 10**18
-                    if balance > 0:
-                        logger.info(f"Found native balance: {balance:.6f} on {chain_id} for {address[:6]}...")
-                    return balance
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Failed to parse native balance result for {context}: {e}")
-                    continue
+            for rpc_url in rpc_urls:
+                native_responses = await make_batch_rpc_call(
+                    session, rpc_url, native_payloads, f"native batch on {chain_id}"
+                )
+                
+                success_count = 0
+                for check, response in zip(native_checks, native_responses):
+                    if response and 'result' in response:
+                        try:
+                            balance = int(response['result'], 16) / 10**18
+                            results.append((check.chain_id, check.symbol, balance))
+                            success_count += 1
+                        except (ValueError, TypeError):
+                            results.append((check.chain_id, check.symbol, 0.0))
+                    else:
+                        results.append((check.chain_id, check.symbol, 0.0))
+                
+                if success_count == len(native_checks):
+                    break  # All succeeded, no need to try other RPCs
         
-        logger.error(f"Failed to get {context} from all RPCs: {rpc_urls}")
-        return 0.0
-
-async def get_erc20_balance_with_fallback(session: aiohttp.ClientSession, rpc_urls: List[str], 
-                                        contract: str, address: str, chain_id: str, symbol: str,
-                                        semaphore: asyncio.Semaphore) -> float:
-    """Get ERC20 balance with precomputed decimals to avoid extra RPC calls"""
-    async with semaphore:
-        context = f"{symbol} balance for {address[:6]}...{address[-4:]} on {chain_id}"
-        
-        # Use precomputed decimals if available
-        decimals = TOKEN_DECIMALS.get(symbol, 18)  # Default to 18 if not found
-        
-        for rpc_url in rpc_urls:
-            try:
-                # Only need balance call - skip decimals call for known tokens
-                balance_payload = {
+        # Process ERC20 balances in batch
+        if erc20_checks:
+            erc20_payloads = []
+            for i, check in enumerate(erc20_checks):
+                erc20_payloads.append({
                     "jsonrpc": "2.0",
                     "method": "eth_call",
                     "params": [{
-                        "to": contract,
-                        "data": f"0x70a08231{address[2:].zfill(64)}"
+                        "to": check.contract,
+                        "data": f"0x70a08231{check.address[2:].zfill(64)}"
                     }, "latest"],
-                    "id": 1
-                }
+                    "id": len(native_checks) + i + 1
+                })
+            
+            for rpc_url in rpc_urls:
+                erc20_responses = await make_batch_rpc_call(
+                    session, rpc_url, erc20_payloads, f"ERC20 batch on {chain_id}"
+                )
                 
-                balance_data = await make_rpc_call_with_retries(session, rpc_url, balance_payload, f"{context} (balance)")
-                
-                if balance_data and 'result' in balance_data and balance_data['result']:
-                    try:
-                        balance_raw = int(balance_data['result'], 16)
-                        
-                        if balance_raw > 0:  # Only calculate if there's a balance
+                success_count = 0
+                for check, response in zip(erc20_checks, erc20_responses):
+                    if response and 'result' in response:
+                        try:
+                            balance_raw = int(response['result'], 16)
+                            decimals = TOKEN_DECIMALS.get(check.symbol, 18)
                             balance = balance_raw / (10 ** decimals)
-                            logger.info(f"Found {symbol} balance: {balance:.6f} on {chain_id} for {address[:6]}...")
-                            return balance
-                        return 0.0
-                        
-                    except (ValueError, TypeError, OverflowError) as e:
-                        logger.warning(f"Failed to parse {context} result: {e}")
-                        continue
-                        
-            except Exception as e:
-                logger.warning(f"Unexpected error for {context} on {rpc_url}: {e}")
-                continue
+                            results.append((check.chain_id, check.symbol, balance))
+                            success_count += 1
+                        except (ValueError, TypeError):
+                            results.append((check.chain_id, check.symbol, 0.0))
+                    else:
+                        results.append((check.chain_id, check.symbol, 0.0))
+                
+                if success_count == len(erc20_checks):
+                    break  # All succeeded, no need to try other RPCs
         
-        logger.error(f"Failed to get {context} from all RPCs: {rpc_urls}")
-        return 0.0
+        return results
 
-async def get_all_asset_balances(session: aiohttp.ClientSession, addresses: List[str]) -> Dict:
-    """Get all asset balances with aggressive optimization for speed"""
+async def get_all_asset_balances_optimized(session: aiohttp.ClientSession, addresses: List[str]) -> Dict:
+    """Optimized balance fetching with batching and parallel processing"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     
-    logger.info(f"Starting balance checks for {len(addresses)} addresses across {len(CHAINS)} chains")
+    # Generate all balance checks
+    all_checks = []
     
-    # Prioritize by speed and reliability
-    chain_priority = ['ethereum', 'arbitrum', 'polygon', 'bsc', 'optimism', 'base', 'ink', 'unichain']
-    
-    results = []
-    
-    # Process native balances first (fastest)
-    native_tasks = []
     for addr in addresses:
-        for chain_id in chain_priority:
-            if chain_id not in CHAINS:
-                continue
-            chain_info = CHAINS[chain_id]
-            native_tasks.append(fetch_native_balance(session, chain_info['rpcs'], addr, chain_id, 
-                                                    chain_info['symbol'], semaphore))
-    
-    logger.info(f"Processing {len(native_tasks)} native balance checks...")
-    
-    # Execute native balances in one batch (they're fast)
-    native_results = await asyncio.gather(*native_tasks, return_exceptions=True)
-    for result in native_results:
-        if isinstance(result, Exception):
-            logger.error(f"Native balance task failed: {result}")
-        else:
-            results.append(result)
-    
-    logger.info(f"Completed native balances, found {sum(1 for _, _, balance in results if balance > 0.000001)} non-zero")
-    
-    # Process ERC20 balances chain by chain to avoid rate limiting
-    for chain_id in chain_priority:
-        if chain_id not in CHAINS or chain_id not in ERC20_CONTRACTS:
-            continue
+        for chain_id, chain_info in CHAINS.items():
+            # Native balance check
+            all_checks.append(BalanceCheck(
+                chain_id=chain_id,
+                address=addr,
+                symbol=chain_info['symbol'],
+                is_native=True
+            ))
             
-        chain_tasks = []
-        for addr in addresses:
-            for symbol, contract in ERC20_CONTRACTS[chain_id].items():
-                if len(contract) != 42 or not contract.startswith('0x'):
-                    continue
-                chain_tasks.append(fetch_erc20_balance(session, CHAINS[chain_id]['rpcs'], contract, addr, 
-                                                     chain_id, symbol, semaphore))
-        
-        if chain_tasks:
-            logger.info(f"Processing {len(chain_tasks)} ERC20 checks for {chain_id}...")
-            
-            # Process each chain separately with delays
-            chain_results = await asyncio.gather(*chain_tasks, return_exceptions=True)
-            for result in chain_results:
-                if isinstance(result, Exception):
-                    logger.error(f"ERC20 task failed on {chain_id}: {result}")
-                else:
-                    results.append(result)
-            
-            # Delay between chains to avoid cross-contamination of rate limits
-            await asyncio.sleep(0.5)
+            # ERC20 balance checks
+            if chain_id in ERC20_CONTRACTS:
+                for symbol, contract in ERC20_CONTRACTS[chain_id].items():
+                    all_checks.append(BalanceCheck(
+                        chain_id=chain_id,
+                        address=addr,
+                        symbol=symbol,
+                        contract=contract,
+                        is_native=False
+                    ))
+    
+    logger.info(f"Generated {len(all_checks)} balance checks for {len(addresses)} addresses")
+    
+    # Group checks by chain for batch processing
+    chain_groups = defaultdict(list)
+    for check in all_checks:
+        chain_groups[check.chain_id].append(check)
+    
+    # Process each chain's checks in batches
+    tasks = []
+    for chain_id, checks in chain_groups.items():
+        # Split into smaller batches to avoid overwhelming single RPCs
+        for i in range(0, len(checks), BATCH_SIZE):
+            batch = checks[i:i + BATCH_SIZE]
+            tasks.append(process_balance_batch(session, batch, semaphore))
+    
+    logger.info(f"Processing {len(tasks)} batches across {len(chain_groups)} chains")
+    
+    # Execute all batches concurrently
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
     
     # Aggregate results
     aggregated = {}
-    successful_checks = 0
+    total_balances = 0
     
-    for chain_id, symbol, balance in results:
-        if balance and balance > 0.000001:  # Filter out dust
-            if chain_id not in aggregated:
-                aggregated[chain_id] = {}
-            if symbol not in aggregated[chain_id]:
-                aggregated[chain_id][symbol] = 0
-            aggregated[chain_id][symbol] += balance
-            successful_checks += 1
+    for batch_result in batch_results:
+        if isinstance(batch_result, Exception):
+            logger.error(f"Batch failed: {batch_result}")
+            continue
+            
+        for chain_id, symbol, balance in batch_result:
+            if balance and balance > 0.000001:  # Filter out dust
+                if chain_id not in aggregated:
+                    aggregated[chain_id] = {}
+                if symbol not in aggregated[chain_id]:
+                    aggregated[chain_id][symbol] = 0
+                aggregated[chain_id][symbol] += balance
+                total_balances += 1
     
-    logger.info(f"Aggregated {successful_checks} non-zero balances across {len(aggregated)} chains")
+    logger.info(f"Found {total_balances} non-zero balances across {len(aggregated)} chains")
     return aggregated
-
-async def fetch_native_balance(session, rpcs, addr, chain_id, symbol, sem) -> Tuple[str, str, float]:
-    """Wrapper function for native balance fetching"""
-    balance = await get_native_balance_with_fallback(session, rpcs, addr, chain_id, sem)
-    return chain_id, symbol, balance
-
-async def fetch_erc20_balance(session, rpcs, contract, addr, chain_id, symbol, sem) -> Tuple[str, str, float]:
-    """Wrapper function for ERC20 balance fetching"""
-    balance = await get_erc20_balance_with_fallback(session, rpcs, contract, addr, chain_id, symbol, sem)
-    return chain_id, symbol, balance
 
 # --- Address Parsing and ENS Resolution ---
 
 async def resolve_ens_to_address(session: aiohttp.ClientSession, name: str) -> str | None:
-    """Resolve ENS name to address with better error handling"""
+    """Resolve ENS name to address with timeout"""
     try:
         async with session.get(f"https://api.ensideas.com/ens/resolve/{name.lower()}", 
-                             timeout=10) as response:
+                             timeout=5) as response:
             if response.status == 200:
                 data = await response.json()
                 address = data.get("address")
                 if address:
                     logger.info(f"Resolved ENS {name} to {address}")
                 return address
-            else:
-                logger.warning(f"ENS resolution failed for {name}: HTTP {response.status}")
     except Exception as e:
         logger.warning(f"ENS resolution error for {name}: {e}")
     return None
@@ -311,7 +358,7 @@ async def parse_and_resolve_addresses(session: aiohttp.ClientSession, text: str)
     
     logger.info(f"Found {len(found_addresses)} addresses and {len(found_ens_names)} ENS names")
     
-    # Resolve ENS names
+    # Resolve ENS names concurrently
     if found_ens_names:
         resolved_addresses = await asyncio.gather(
             *(resolve_ens_to_address(session, name) for name in found_ens_names),
@@ -332,7 +379,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_url = "https://i.ibb.co/qMZjmJ9V/eth2.png"
     welcome_message = f"[​]({image_url})"
     welcome_message += """
-    🤖 **Crypto Balance Bot**
+    🤖 **Crypto Balance Bot** ⚡
 
 I'll help you check native and stablecoin balances across multiple EVM chains! I also resolve `.eth` names.
 
@@ -345,8 +392,6 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 • Base
 • Ink
 • Arbitrum
-• Abstract
-• Hyperliquid
 • Unichain
 • Polygon
 • Optimism
@@ -372,7 +417,15 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_message = await update.message.reply_text("🔍 Resolving addresses...")
     
     try:
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)) as session:
+        # Use connection pooling for better performance
+        connector = aiohttp.TCPConnector(
+            limit=100, 
+            ttl_dns_cache=300, 
+            use_dns_cache=True,
+            keepalive_timeout=30
+        )
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
             # Parse and resolve addresses
             addresses = await parse_and_resolve_addresses(session, update.message.text)
             if not addresses:
@@ -383,10 +436,10 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_message.edit_text("❌ Too many addresses! Please limit to 200 addresses maximum.")
                 return
 
-            await status_message.edit_text(f"✅ Found {len(addresses)} unique address(es).\n🔄 Fetching all balances across all chains...")
+            await status_message.edit_text(f"✅ Found {len(addresses)} unique address(es).\n⚡ Fetching all balances with optimized batch processing...")
             
             # Get balances and ETH price concurrently
-            balance_task = get_all_asset_balances(session, addresses)
+            balance_task = get_all_asset_balances_optimized(session, addresses)
             price_task = get_eth_price(session)
             
             aggregated_balances, eth_price = await asyncio.gather(balance_task, price_task)
@@ -407,7 +460,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Build response message
         execution_time = asyncio.get_event_loop().time() - start_time
-        final_message = f"📊 **Balance Summary for {len(addresses)} address(es)** (⏱️ {execution_time:.1f}s)\n\n"
+        final_message = f"📊 **Balance Summary for {len(addresses)} address(es)** (⚡ {execution_time:.1f}s)\n\n"
         
         # Per-chain breakdown
         for chain_id, tokens in sorted(aggregated_balances.items()):
