@@ -185,6 +185,9 @@ async def get_erc20_balance_with_fallback(session: aiohttp.ClientSession, rpc_ur
                     except (ValueError, TypeError, OverflowError) as e:
                         logger.warning(f"Failed to parse {context} result: {e}")
                         continue
+            except Exception as e:
+                logger.warning(f"Unexpected error for {context} on {rpc_url}: {e}")
+                continue
         
         logger.error(f"Failed to get {context} from all RPCs: {rpc_urls}")
         return 0.0
