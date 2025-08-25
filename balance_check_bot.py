@@ -418,7 +418,7 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 **Commands:**
 /start - Show this help message
 /about - Info & support the creator
-/debug - Test RPC endpoint speeds (during beta)
+/debug - Test RPC endpoint speeds (admin only)
 
 **Supported Chains:**
 • Ethereum Mainnet
@@ -539,23 +539,23 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             async with aiohttp.ClientSession(connector=connector) as session:
-            # Parse and resolve addresses
-            addresses = await parse_and_resolve_addresses(session, update.message.text)
-            if not addresses:
-                await status_message.edit_text("❌ I didn't find any valid addresses or `.eth` names.")
-                return
+                # Parse and resolve addresses
+                    addresses = await parse_and_resolve_addresses(session, update.message.text)
+                if not addresses:
+                    await status_message.edit_text("❌ I didn't find any valid addresses or `.eth` names.")
+                    return
 
-            if len(addresses) > 200:
-                await status_message.edit_text("❌ Too many addresses! Please limit to 200 addresses maximum.")
-                return
+                if len(addresses) > 200:
+                    await status_message.edit_text("❌ Too many addresses! Please limit to 200 addresses maximum.")
+                    return
 
-            await status_message.edit_text(f"✅ Found {len(addresses)} unique address(es).\n⚡ Fetching all balances with optimized batch processing...")
-            
-            # Get balances and ETH price concurrently
-            balance_task = get_all_asset_balances_optimized(session, addresses)
-            price_task = get_eth_price(session)
-            
-            aggregated_balances, eth_price = await asyncio.gather(balance_task, price_task)
+                await status_message.edit_text(f"✅ Found {len(addresses)} unique address(es).\n⚡ Fetching all balances with optimized batch processing...")
+                
+                # Get balances and ETH price concurrently
+                balance_task = get_all_asset_balances_optimized(session, addresses)
+                price_task = get_eth_price(session)
+                
+                aggregated_balances, eth_price = await asyncio.gather(balance_task, price_task)
     
         if not aggregated_balances:
             await status_message.edit_text("❌ No balances found for the provided addresses.")
