@@ -529,34 +529,33 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start_time = asyncio.get_event_loop().time()
         status_message = await update.message.reply_text("🔍 Resolving addresses...")
         
-        try:
-            # Use smaller connection pool under load
-            connector = aiohttp.TCPConnector(
-                limit=50,  # Reduced from 100
-                ttl_dns_cache=300, 
-                use_dns_cache=True,
-                keepalive_timeout=15  # Shorter keepalive
-            )
+        # Use smaller connection pool under load
+        connector = aiohttp.TCPConnector(
+            limit=50,  # Reduced from 100
+            ttl_dns_cache=300, 
+            use_dns_cache=True,
+            keepalive_timeout=15  # Shorter keepalive
+        )
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Parse and resolve addresses
+            addresses = await parse_and_resolve_addresses(session, update.message.text)
+            if not addresses:
+                await status_message.edit_text("❌ I didn't find any valid addresses or `.eth` names.")
+                return
+
+            if len(addresses) > 200:
+                await status_message.edit_text("❌ Too many addresses! Please limit to 200 addresses maximum.")
+                return
+
+            await status_message.edit_text(f"✅ Found {len(addresses)} unique address(es).\n⚡ Fetching all balances with optimized batch processing...")
             
-            async with aiohttp.ClientSession(connector=connector) as session:
-                # Parse and resolve addresses
-                addresses = await parse_and_resolve_addresses(session, update.message.text)
-                if not addresses:
-                    await status_message.edit_text("❌ I didn't find any valid addresses or `.eth` names.")
-                    return
+            # Get balances and ETH price concurrently
+            balance_task = get_all_asset_balances_optimized(session, addresses)
+            price_task = get_eth_price(session)
+            
+            aggregated_balances, eth_price = await asyncio.gather(balance_task, price_task)
 
-                if len(addresses) > 200:
-                    await status_message.edit_text("❌ Too many addresses! Please limit to 200 addresses maximum.")
-                    return
-
-                await status_message.edit_text(f"✅ Found {len(addresses)} unique address(es).\n⚡ Fetching all balances with optimized batch processing...")
-                
-                # Get balances and ETH price concurrently
-                balance_task = get_all_asset_balances_optimized(session, addresses)
-                price_task = get_eth_price(session)
-                
-                aggregated_balances, eth_price = await asyncio.gather(balance_task, price_task)
-    
         if not aggregated_balances:
             await status_message.edit_text("❌ No balances found for the provided addresses.")
             return
@@ -641,3 +640,58 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 final_message += f"\n💰 **ETH Value:** `${eth_usd:,.2f}` (@ `${eth_price:,.2f}/ETH`)\n"
             
             # Add stablecoin values
+            stablecoin_total = grand_totals.get('USDC', 0) + grand_totals.get('USDT', 0)
+            if stablecoin_total > 0:
+                portfolio_usd += stablecoin_total
+                final_message += f"💵 **Stablecoin Value:** `${stablecoin_total:,.2f}`\n"
+            
+            if portfolio_usd > 0:
+                final_message += f"🏦 **Total Portfolio Value:** `${portfolio_usd:,.2f}`\n"
+        
+        final_message += f"\n✅ Found balances on {total_chains_with_balances} chain(s)"
+        
+        await status_message.edit_text(final_message, parse_mode='Markdown', disable_web_page_preview=True)
+        
+        # Log summary for debugging
+        logger.info(f"Completed balance check for {len(addresses)} addresses in {execution_time:.1f}s. "
+                   f"Found balances on {total_chains_with_balances} chains. User: {user_id}")
+
+    except Exception as e:
+        logger.error(f"Error in balance_command for user {user_id}: {e}", exc_info=True)
+        await status_message.edit_text(f"❌ An error occurred while fetching balances. Please try again.\n\nError: {str(e)[:100]}")
+    
+    finally:
+        # Always decrement active requests counter
+        active_user_requests[user_id] = max(0, active_user_requests[user_id] - 1)
+
+# --- Lifespan Manager & Web Server Setup ---
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    if not TELEGRAM_TOKEN:
+        logger.critical("CRITICAL: TELEGRAM_TOKEN not set.")
+        yield
+        return
+        
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("about", about_command))
+    application.add_handler(CommandHandler("debug", debug_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, balance_command))
+    
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+    logger.info("Telegram bot started successfully.")
+    
+    yield
+    
+    await application.updater.stop()
+    await application.stop()
+    await application.shutdown()
+    logger.info("Telegram bot has been shut down.")
+
+web_app = FastAPI(lifespan=lifespan)
+
+@web_app.api_route("/", methods=["GET", "HEAD"])
+def health_check():
+    return {"status": "ok, bot is running"}
