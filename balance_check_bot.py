@@ -6,11 +6,16 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
+import time
 
 import aiohttp
 from fastapi import FastAPI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+# Rate limiting for users
+user_last_request = {}
+active_user_requests = defaultdict(int)
 
 # --- Standard Configuration ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -22,10 +27,11 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
 # --- Bot Configuration ---
 TIP_ADDRESS = "0x50A0d7Fb9f64e908688443cB94c3971705599d79"
-MAX_CONCURRENT_REQUESTS = 20  # Increased for better parallelism
-REQUEST_TIMEOUT = 8  # Reduced timeout
-MAX_RETRIES = 2  # Reduced retries
-BATCH_SIZE = 10  # For batch RPC calls
+MAX_CONCURRENT_REQUESTS = 15  # Reduced for stability under load
+REQUEST_TIMEOUT = 6  # Faster timeout for quicker failover
+MAX_RETRIES = 1  # Faster failure for better UX under load
+BATCH_SIZE = 8  # Smaller batches for better resource management
+USER_RATE_LIMIT = 3  # Max 3 concurrent requests per user
 
 # Precomputed decimals to avoid extra RPC calls
 TOKEN_DECIMALS = {
@@ -412,6 +418,7 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 **Commands:**
 /start - Show this help message
 /about - Info & support the creator
+/debug - Test RPC endpoint speeds (during beta)
 
 **Supported Chains:**
 • Ethereum Mainnet
@@ -441,20 +448,97 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     about_message = f"Tip Jar (ETH/EVM):\n`{TIP_ADDRESS}`"
     await update.message.reply_text(about_message, parse_mode='Markdown')
 
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test RPC endpoint speeds for debugging"""
+    # You can restrict this to your user ID for security
+    # user_id = update.effective_user.id
+    # if user_id != YOUR_TELEGRAM_USER_ID:  # Replace with your actual user ID
+    #     await update.message.reply_text("❌ Debug command is admin-only.")
+    #     return
+    
+    status_message = await update.message.reply_text("🔧 Testing RPC endpoint speeds...")
+    
+    test_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"  # Vitalik's address
+    results = []
+    
+    connector = aiohttp.TCPConnector(limit=20)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        
+        for chain_id, chain_info in CHAINS.items():
+            chain_results = []
+            
+            for rpc_url in chain_info['rpcs'][:2]:  # Test first 2 RPCs per chain
+                start_time = asyncio.get_event_loop().time()
+                
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": "eth_getBalance", 
+                    "params": [test_address, "latest"],
+                    "id": 1
+                }
+                
+                try:
+                    async with session.post(rpc_url, json=payload, timeout=10) as response:
+                        end_time = asyncio.get_event_loop().time()
+                        response_time = end_time - start_time
+                        
+                        if response.status == 200:
+                            data = await response.json()
+                            if 'result' in data:
+                                status = f"✅ {response_time:.2f}s"
+                            else:
+                                status = f"❌ RPC Error {response_time:.2f}s"
+                        else:
+                            status = f"❌ HTTP {response.status} {response_time:.2f}s"
+                            
+                except asyncio.TimeoutError:
+                    status = "⏰ Timeout >10s"
+                except Exception as e:
+                    status = f"❌ Error: {str(e)[:20]}"
+                
+                rpc_name = rpc_url.split('//')[1].split('/')[0]
+                chain_results.append(f"  {rpc_name}: {status}")
+            
+            results.append(f"**{chain_info['name']}:**\n" + "\n".join(chain_results))
+    
+    debug_message = "🔧 **RPC Endpoint Speed Test:**\n\n" + "\n\n".join(results)
+    debug_message += f"\n\n💡 **Analysis:** Look for endpoints consistently >3s or with errors."
+    
+    await status_message.edit_text(debug_message, parse_mode='Markdown')
+
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_time = asyncio.get_event_loop().time()
-    status_message = await update.message.reply_text("🔍 Resolving addresses...")
+    user_id = update.effective_user.id
+    current_time = time.time()
+    
+    # Rate limiting: max 1 request per 10 seconds per user
+    if user_id in user_last_request:
+        time_since_last = current_time - user_last_request[user_id]
+        if time_since_last < 10:
+            await update.message.reply_text(f"⏳ Please wait {10 - int(time_since_last)} seconds before your next request.")
+            return
+    
+    # Check concurrent requests for this user
+    if active_user_requests[user_id] >= USER_RATE_LIMIT:
+        await update.message.reply_text("⚠️ You have too many active requests. Please wait for them to complete.")
+        return
+    
+    user_last_request[user_id] = current_time
+    active_user_requests[user_id] += 1
     
     try:
-        # Use connection pooling for better performance
-        connector = aiohttp.TCPConnector(
-            limit=100, 
-            ttl_dns_cache=300, 
-            use_dns_cache=True,
-            keepalive_timeout=30
-        )
+        start_time = asyncio.get_event_loop().time()
+        status_message = await update.message.reply_text("🔍 Resolving addresses...")
         
-        async with aiohttp.ClientSession(connector=connector) as session:
+        try:
+            # Use smaller connection pool under load
+            connector = aiohttp.TCPConnector(
+                limit=50,  # Reduced from 100
+                ttl_dns_cache=300, 
+                use_dns_cache=True,
+                keepalive_timeout=15  # Shorter keepalive
+            )
+            
+            async with aiohttp.ClientSession(connector=connector) as session:
             # Parse and resolve addresses
             addresses = await parse_and_resolve_addresses(session, update.message.text)
             if not addresses:
@@ -571,11 +655,15 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Log summary for debugging
         logger.info(f"Completed balance check for {len(addresses)} addresses in {execution_time:.1f}s. "
-                   f"Found balances on {total_chains_with_balances} chains. Grand totals: {grand_totals}")
+                   f"Found balances on {total_chains_with_balances} chains. User: {user_id}")
 
     except Exception as e:
-        logger.error(f"Error in balance_command: {e}", exc_info=True)
+        logger.error(f"Error in balance_command for user {user_id}: {e}", exc_info=True)
         await status_message.edit_text(f"❌ An error occurred while fetching balances. Please try again.\n\nError: {str(e)[:100]}")
+    
+    finally:
+        # Always decrement active requests counter
+        active_user_requests[user_id] = max(0, active_user_requests[user_id] - 1)
 
 # --- Lifespan Manager & Web Server Setup ---
 @asynccontextmanager
@@ -588,6 +676,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("about", about_command))
+    application.add_handler(CommandHandler("debug", debug_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, balance_command))
     
     await application.initialize()
