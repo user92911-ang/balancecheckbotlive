@@ -31,6 +31,9 @@ BATCH_SIZE = 10  # For batch RPC calls
 TOKEN_DECIMALS = {
     'USDT': 6,
     'USDC': 6,
+    # BSC-specific overrides for correct decimals
+    'bsc_USDT': 18,  # BSC USDT uses 18 decimals, not 6!
+    'bsc_USDC': 18,  # BSC USDC uses 18 decimals, not 6!
 }
 
 @dataclass
@@ -107,6 +110,11 @@ CHAINS = {
         'symbol': 'ETH', 
         'rpcs': ['https://mainnet.unichain.org']
     },
+    'abstract': {
+        'name': 'Abstract', 
+        'symbol': 'ETH', 
+        'rpcs': ['https://api.mainnet.abs.xyz']
+    },
 }
 
 ERC20_CONTRACTS = {
@@ -118,6 +126,7 @@ ERC20_CONTRACTS = {
     'bsc': {'USDT': '0x55d398326f99059ff775485246999027b3197955', 'USDC': '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d'},
     'ink': {'USDT': '0x0200C29006150606B650577BBE7B6248F58470c1'},
     'unichain': {'USDT': '0x9151434b16b9763660705744891fA906F660EcC5'},
+    'abstract': {'USDC': '0x07865c6E87B9F70255377e024ace6630C1Eaa37F', 'USDT': '0x0200C29006150606B650577BBE7B6248F58470c1'},
 }
 
 class BalanceFetchError(Exception):
@@ -248,7 +257,9 @@ async def process_balance_batch(session: aiohttp.ClientSession,
                     if response and 'result' in response:
                         try:
                             balance_raw = int(response['result'], 16)
-                            decimals = TOKEN_DECIMALS.get(check.symbol, 18)
+                            # Fix BSC decimal issue - BSC stablecoins use 18 decimals
+                            decimals_key = f"{check.chain_id}_{check.symbol}" if check.chain_id == 'bsc' else check.symbol
+                            decimals = TOKEN_DECIMALS.get(decimals_key, 18)
                             balance = balance_raw / (10 ** decimals)
                             results.append((check.chain_id, check.symbol, balance))
                             success_count += 1
@@ -349,12 +360,27 @@ async def resolve_ens_to_address(session: aiohttp.ClientSession, name: str) -> s
     return None
 
 async def parse_and_resolve_addresses(session: aiohttp.ClientSession, text: str) -> List[str]:
-    """Parse and resolve addresses with improved validation"""
+    """Parse and resolve addresses with improved validation and common address formats"""
+    # Enhanced patterns
     address_pattern = r'0x[a-fA-F0-9]{40}'
     ens_pattern = r'[a-zA-Z0-9-]+\.eth'
     
-    found_addresses = {addr.lower() for addr in re.findall(address_pattern, text)}
-    found_ens_names = {name.lower() for name in re.findall(ens_pattern, text)}
+    # Also look for addresses in common formats like "Address: 0x..." or "Wallet: 0x..."
+    context_address_pattern = r'(?:address|wallet|addr|account)[:=\s]+0x[a-fA-F0-9]{40}'
+    
+    found_addresses = set()
+    found_ens_names = set()
+    
+    # Standard extraction
+    found_addresses.update(addr.lower() for addr in re.findall(address_pattern, text, re.IGNORECASE))
+    found_ens_names.update(name.lower() for name in re.findall(ens_pattern, text, re.IGNORECASE))
+    
+    # Extract from contextual patterns
+    contextual_matches = re.findall(context_address_pattern, text, re.IGNORECASE)
+    for match in contextual_matches:
+        addr_match = re.search(r'0x[a-fA-F0-9]{40}', match, re.IGNORECASE)
+        if addr_match:
+            found_addresses.add(addr_match.group().lower())
     
     logger.info(f"Found {len(found_addresses)} addresses and {len(found_ens_names)} ENS names")
     
@@ -390,7 +416,8 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 **Supported Chains:**
 • Ethereum Mainnet
 • Base
-• Ink
+• Ink  
+• Abstract
 • Arbitrum
 • Unichain
 • Polygon
@@ -405,6 +432,8 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 **Example:**
 0x742d35Cc6634C0532925a3b8D5C9E49C7F59c2c4
 vitalik.eth
+
+⚡ **Now with lightning-fast batch processing!**
 """
     await update.message.reply_text(welcome_message, parse_mode='Markdown', disable_web_page_preview=False)
 
@@ -458,33 +487,83 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     grand_totals[symbol] = 0
                 grand_totals[symbol] += balance
 
-        # Build response message
+        # Build response message with better formatting
         execution_time = asyncio.get_event_loop().time() - start_time
         final_message = f"📊 **Balance Summary for {len(addresses)} address(es)** (⚡ {execution_time:.1f}s)\n\n"
         
-        # Per-chain breakdown
-        for chain_id, tokens in sorted(aggregated_balances.items()):
+        # Sort chains by total USD value if possible, otherwise alphabetically
+        chain_items = list(aggregated_balances.items())
+        try:
+            # Sort by ETH value first (proxy for importance), then alphabetically
+            chain_items.sort(key=lambda x: (
+                -x[1].get('ETH', 0),  # Descending ETH amount
+                x[0]  # Ascending chain name
+            ))
+        except:
+            chain_items.sort()  # Fallback to alphabetical
+        
+        # Per-chain breakdown with better formatting
+        for chain_id, tokens in chain_items:
             chain_name = CHAINS[chain_id]['name']
             token_lines = []
-            for symbol, balance in sorted(tokens.items()):
+            
+            # Sort tokens by value (ETH first, then stablecoins, then alphabetical)
+            token_items = list(tokens.items())
+            token_items.sort(key=lambda x: (
+                0 if x[0] in ['ETH'] else 1 if x[0] in ['USDC', 'USDT'] else 2,  # Priority order
+                -x[1]  # Descending balance within category
+            ))
+            
+            for symbol, balance in token_items:
                 if balance >= 0.000001:  # Only show meaningful balances
-                    token_lines.append(f"{balance:,.6f} {symbol}".rstrip('0').rstrip('.'))
+                    if symbol in ['USDC', 'USDT']:
+                        # Format stablecoins with 2 decimal places for readability
+                        formatted_balance = f"{balance:,.2f}"
+                    elif symbol in ['ETH', 'BNB', 'MATIC']:
+                        # Format native tokens with up to 6 decimals, removing trailing zeros
+                        formatted_balance = f"{balance:,.6f}".rstrip('0').rstrip('.')
+                    else:
+                        formatted_balance = f"{balance:,.6f}".rstrip('0').rstrip('.')
+                    
+                    token_lines.append(f"{formatted_balance} {symbol}")
             
             if token_lines:
                 final_message += f"• **{chain_name}:** {', '.join(token_lines)}\n"
         
-        # Grand totals
+        # Grand totals with better formatting
         if grand_totals:
             final_message += "\n" + "="*30 + "\n**🎯 GRAND TOTALS ACROSS ALL CHAINS:**\n"
-            for symbol, total in sorted(grand_totals.items()):
+            
+            # Sort totals by importance
+            total_items = list(grand_totals.items())
+            total_items.sort(key=lambda x: (
+                0 if x[0] in ['ETH'] else 1 if x[0] in ['USDC', 'USDT'] else 2,
+                -x[1]
+            ))
+            
+            for symbol, total in total_items:
                 if total >= 0.000001:
-                    formatted_total = f"{total:,.6f}".rstrip('0').rstrip('.')
+                    if symbol in ['USDC', 'USDT']:
+                        formatted_total = f"{total:,.2f}"
+                    else:
+                        formatted_total = f"{total:,.6f}".rstrip('0').rstrip('.')
                     final_message += f"**{symbol}:** {formatted_total}\n"
 
-            # ETH USD value
+            # Calculate total portfolio value if possible
+            portfolio_usd = 0
             if 'ETH' in grand_totals and grand_totals['ETH'] > 0 and eth_price > 0:
-                usd_value = grand_totals['ETH'] * eth_price
-                final_message += f"\n💰 **Total ETH Value:** `${usd_value:,.2f}` (@ `${eth_price:,.2f}/ETH`)\n"
+                eth_usd = grand_totals['ETH'] * eth_price
+                portfolio_usd += eth_usd
+                final_message += f"\n💰 **ETH Value:** `${eth_usd:,.2f}` (@ `${eth_price:,.2f}/ETH`)\n"
+            
+            # Add stablecoin values
+            stablecoin_total = grand_totals.get('USDC', 0) + grand_totals.get('USDT', 0)
+            if stablecoin_total > 0:
+                portfolio_usd += stablecoin_total
+                final_message += f"💵 **Stablecoin Value:** `${stablecoin_total:,.2f}`\n"
+            
+            if portfolio_usd > 0:
+                final_message += f"🏦 **Total Portfolio Value:** `${portfolio_usd:,.2f}`\n"
         
         final_message += f"\n✅ Found balances on {total_chains_with_balances} chain(s)"
         
