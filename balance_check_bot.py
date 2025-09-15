@@ -48,6 +48,9 @@ TOKEN_DECIMALS = {
     # BSC-specific overrides for correct decimals
     'bsc_USDT': 18,
     'bsc_USDC': 18,
+    # Hyperliquid EVM tokens
+    'WHYPE': 18,  # Wrapped HYPE uses 18 decimals
+    'stHYPE': 18,  # Staked HYPE uses 18 decimals
 }
 
 @dataclass
@@ -129,6 +132,14 @@ CHAINS = {
             'https://bsc.publicnode.com'
         ]
     },
+    'hyperliquid': {
+        'name': 'Hyperliquid EVM', 
+        'symbol': 'HYPE', 
+        'rpcs': [
+            'https://rpc.hyperliquid.xyz/evm',
+            # Can add more RPCs from providers like Chainstack if needed
+        ]
+    },
     'ink': {
         'name': 'Ink', 
         'symbol': 'ETH', 
@@ -153,6 +164,10 @@ ERC20_CONTRACTS = {
     'optimism': {'USDC': '0x0b2c639c533813f4aa9d7837caf62653d097ff85', 'USDT': '0x94b008aa00579c1307b0ef2c499ad98a8ce58e58'},
     'polygon': {'USDC': '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', 'USDT': '0xc2132D05D31c914a87C6611C10748AEb04B58e8F'},
     'bsc': {'USDT': '0x55d398326f99059ff775485246999027b3197955', 'USDC': '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d'},
+    'hyperliquid': {
+        'WHYPE': '0x5555555555555555555555555555555555555555',  # Wrapped HYPE
+        'stHYPE': '0xffaa4a3d97fe9107cef8a3f48c069f577ff76cc1'  # Staked HYPE
+    },
     'ink': {'USDT': '0x0200C29006150606B650577BBE7B6248F58470c1'},
     'unichain': {'USDT': '0x9151434b16b9763660705744891fA906F660EcC5'},
     'abstract': {'USDC': '0x07865c6E87B9F70255377e024ace6630C1Eaa37F', 'USDT': '0x0200C29006150606B650577BBE7B6248F58470c1'},
@@ -422,7 +437,7 @@ async def verify_critical_balances(session: aiohttp.ClientSession, addresses: Li
     """Re-verify balances for critical chains like Base with more robust checking"""
     logger.info("Running verification pass for critical chains...")
     
-    critical_chains = ['base', 'ethereum', 'arbitrum']  # Chains to double-check
+    critical_chains = ['base', 'ethereum', 'arbitrum', 'hyperliquid']  # Added Hyperliquid to critical chains
     verification_checks = []
     
     for addr in addresses:
@@ -630,6 +645,7 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 **Supported Chains:**
 • Ethereum Mainnet
 • Base
+• Hyperliquid EVM (HYPE)
 • Ink  
 • Abstract
 • Arbitrum
@@ -647,7 +663,7 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 0x742d35Cc6634C0532925a3b8D5C9E49C7F59c2c4
 vitalik.eth
 
-⚡ **Enhanced with verification passes for improved accuracy!**
+⚡ **Now checking Hyperliquid EVM for HYPE balances!**
 """
     await update.message.reply_text(welcome_message, parse_mode='Markdown', disable_web_page_preview=False)
 
@@ -835,7 +851,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if balance >= 0.000001:
                     if symbol in ['USDC', 'USDT']:
                         formatted_balance = f"{balance:,.2f}"
-                    elif symbol in ['ETH', 'BNB', 'MATIC']:
+                    elif symbol in ['ETH', 'BNB', 'MATIC', 'HYPE']:
                         formatted_balance = f"{balance:,.6f}".rstrip('0').rstrip('.')
                     else:
                         formatted_balance = f"{balance:,.6f}".rstrip('0').rstrip('.')
