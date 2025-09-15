@@ -7,6 +7,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
 import time
+import random
 
 import aiohttp
 from fastapi import FastAPI
@@ -16,6 +17,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 # Rate limiting for users
 user_last_request = {}
 active_user_requests = defaultdict(int)
+
+# Global session management
+global_session: Optional[aiohttp.ClientSession] = None
 
 # --- Standard Configuration ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -27,11 +31,15 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
 # --- Bot Configuration ---
 TIP_ADDRESS = "0x50A0d7Fb9f64e908688443cB94c3971705599d79"
-MAX_CONCURRENT_REQUESTS = 15  # Reduced for stability under load
-REQUEST_TIMEOUT = 6  # Faster timeout for quicker failover
-MAX_RETRIES = 1  # Faster failure for better UX under load
-BATCH_SIZE = 8  # Smaller batches for better resource management
-USER_RATE_LIMIT = 3  # Max 3 concurrent requests per user
+MAX_CONCURRENT_REQUESTS = 12  # Reduced for better stability
+REQUEST_TIMEOUT = 8  # Increased timeout for reliability
+MAX_RETRIES = 2  # Allow one retry for failed requests
+BATCH_SIZE = 6  # Smaller batches to reduce RPC load
+USER_RATE_LIMIT = 2  # Reduced concurrent requests per user
+RPC_FAILURE_COOLDOWN = 300  # 5 minutes cooldown for failed RPCs
+
+# RPC health tracking
+rpc_failure_tracker = defaultdict(lambda: {"failures": 0, "last_failure": 0})
 
 # Precomputed decimals to avoid extra RPC calls
 TOKEN_DECIMALS = {
@@ -50,7 +58,7 @@ class BalanceCheck:
     contract: Optional[str] = None
     is_native: bool = True
 
-# --- Enhanced Chain Configuration with Faster RPCs First ---
+# --- Enhanced Chain Configuration with Better RPC Management ---
 CHAINS = {
     'ethereum': {
         'name': 'Ethereum Mainnet', 
@@ -58,7 +66,9 @@ CHAINS = {
         'rpcs': [
             'https://eth.llamarpc.com',
             'https://rpc.ankr.com/eth',
-            'https://ethereum.publicnode.com'
+            'https://ethereum.publicnode.com',
+            'https://eth-mainnet.public.blastapi.io',
+            'https://rpc.flashbots.net'
         ]
     },
     'base': {
@@ -67,7 +77,8 @@ CHAINS = {
         'rpcs': [
             'https://mainnet.base.org',
             'https://base.publicnode.com',
-            'https://base-mainnet.public.blastapi.io'
+            'https://base-mainnet.public.blastapi.io',
+            'https://base.llamarpc.com'
         ]
     },
     'arbitrum': {
@@ -76,7 +87,8 @@ CHAINS = {
         'rpcs': [
             'https://arb1.arbitrum.io/rpc',
             'https://rpc.ankr.com/arbitrum',
-            'https://arbitrum.publicnode.com'
+            'https://arbitrum.publicnode.com',
+            'https://arbitrum-one.public.blastapi.io'
         ]
     },
     'optimism': {
@@ -94,7 +106,8 @@ CHAINS = {
         'rpcs': [
             'https://polygon-rpc.com',
             'https://rpc.ankr.com/polygon',
-            'https://polygon.publicnode.com'
+            'https://polygon.publicnode.com',
+            'https://polygon-mainnet.public.blastapi.io'
         ]
     },
     'bsc': {
@@ -103,7 +116,8 @@ CHAINS = {
         'rpcs': [
             'https://bsc-dataseed.binance.org',
             'https://rpc.ankr.com/bsc',
-            'https://bnb.publicnode.com'
+            'https://bnb.publicnode.com',
+            'https://bsc-mainnet.public.blastapi.io'
         ]
     },
     'ink': {
@@ -139,10 +153,75 @@ class BalanceFetchError(Exception):
     """Custom exception for balance fetching errors"""
     pass
 
+# --- Global Session Management ---
+async def get_global_session() -> aiohttp.ClientSession:
+    """Get or create the global session"""
+    global global_session
+    
+    if global_session is None or global_session.closed:
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=15,  # Limit per RPC host
+            ttl_dns_cache=600,  # 10 minutes DNS cache
+            use_dns_cache=True,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True
+        )
+        
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT, connect=5)
+        global_session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={'User-Agent': 'CryptoBalanceBot/1.0'}
+        )
+        logger.info("Created new global aiohttp session")
+    
+    return global_session
+
+def is_rpc_healthy(rpc_url: str) -> bool:
+    """Check if RPC is healthy based on recent failures"""
+    current_time = time.time()
+    tracker = rpc_failure_tracker[rpc_url]
+    
+    # If we haven't had failures recently, it's healthy
+    if tracker["failures"] == 0:
+        return True
+    
+    # If it's been long enough since last failure, reset the tracker
+    if current_time - tracker["last_failure"] > RPC_FAILURE_COOLDOWN:
+        tracker["failures"] = 0
+        return True
+    
+    # If too many recent failures, mark as unhealthy
+    return tracker["failures"] < 3
+
+def mark_rpc_failure(rpc_url: str):
+    """Mark an RPC as having failed"""
+    tracker = rpc_failure_tracker[rpc_url]
+    tracker["failures"] += 1
+    tracker["last_failure"] = time.time()
+    logger.warning(f"RPC failure tracked for {rpc_url} (total: {tracker['failures']})")
+
+def get_healthy_rpcs(chain_id: str) -> List[str]:
+    """Get list of healthy RPCs for a chain, with randomization"""
+    all_rpcs = CHAINS[chain_id]['rpcs']
+    healthy_rpcs = [rpc for rpc in all_rpcs if is_rpc_healthy(rpc)]
+    
+    if not healthy_rpcs:
+        # If no RPCs are healthy, reset all and use original list
+        logger.warning(f"No healthy RPCs for {chain_id}, resetting failure trackers")
+        for rpc in all_rpcs:
+            rpc_failure_tracker[rpc]["failures"] = 0
+        healthy_rpcs = all_rpcs
+    
+    # Randomize order to distribute load
+    random.shuffle(healthy_rpcs)
+    return healthy_rpcs
+
 # --- Optimized RPC and Balance Fetching ---
 
 async def get_eth_price(session: aiohttp.ClientSession) -> float:
-    """Fetch ETH price from CoinGecko"""
+    """Fetch ETH price from CoinGecko with better error handling"""
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": "ethereum", "vs_currencies": "usd"}
     if COINGECKO_API_KEY:
@@ -153,55 +232,78 @@ async def get_eth_price(session: aiohttp.ClientSession) -> float:
             if r.status == 200:
                 data = await r.json()
                 return data.get('ethereum', {}).get('usd', 0.0)
+            elif r.status == 429:
+                logger.warning("CoinGecko rate limited")
     except Exception as e:
         logger.warning(f"ETH price fetch failed: {e}")
     return 0.0
 
-async def make_batch_rpc_call(session: aiohttp.ClientSession, rpc_url: str, 
-                            payloads: List[dict], context: str) -> List[Optional[dict]]:
-    """Make batch RPC call for better efficiency"""
-    if len(payloads) == 1:
-        # Single call
+async def make_batch_rpc_call_with_retry(session: aiohttp.ClientSession, 
+                                       chain_id: str, 
+                                       payloads: List[dict], 
+                                       context: str) -> List[Optional[dict]]:
+    """Make batch RPC call with intelligent retry and RPC selection"""
+    healthy_rpcs = get_healthy_rpcs(chain_id)
+    
+    for rpc_attempt, rpc_url in enumerate(healthy_rpcs):
         try:
-            async with session.post(rpc_url, json=payloads[0], timeout=REQUEST_TIMEOUT) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if 'error' not in data:
-                        return [data]
-                elif response.status == 429:
-                    logger.warning(f"Rate limited on {rpc_url} for {context}")
-                    return [None]
+            if len(payloads) == 1:
+                # Single call
+                async with session.post(rpc_url, json=payloads[0]) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if 'error' not in data:
+                            return [data]
+                    elif response.status == 429:
+                        logger.warning(f"Rate limited on {rpc_url} for {context}")
+                        mark_rpc_failure(rpc_url)
+                        continue
+                    else:
+                        mark_rpc_failure(rpc_url)
+                        continue
+            else:
+                # Batch call
+                async with session.post(rpc_url, json=payloads) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if isinstance(data, list):
+                            results = [item if 'error' not in item else None for item in data]
+                            # If most results are successful, consider it a success
+                            success_count = sum(1 for r in results if r is not None)
+                            if success_count >= len(results) * 0.7:  # 70% success rate
+                                return results
+                        else:
+                            if 'error' not in data:
+                                return [data]
+                    elif response.status == 429:
+                        logger.warning(f"Rate limited on {rpc_url} for batch {context}")
+                        mark_rpc_failure(rpc_url)
+                        continue
+                    else:
+                        mark_rpc_failure(rpc_url)
+                        continue
+                        
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout for {context} on {rpc_url}")
+            mark_rpc_failure(rpc_url)
+            continue
         except Exception as e:
-            logger.warning(f"RPC call failed for {context}: {e}")
-        return [None]
+            logger.warning(f"RPC call failed for {context} on {rpc_url}: {e}")
+            mark_rpc_failure(rpc_url)
+            continue
     
-    # Batch call
-    try:
-        async with session.post(rpc_url, json=payloads, timeout=REQUEST_TIMEOUT) as response:
-            if response.status == 200:
-                data = await response.json()
-                if isinstance(data, list):
-                    return [item if 'error' not in item else None for item in data]
-                else:
-                    return [data if 'error' not in data else None]
-            elif response.status == 429:
-                logger.warning(f"Rate limited on {rpc_url} for batch {context}")
-                return [None] * len(payloads)
-    except Exception as e:
-        logger.warning(f"Batch RPC call failed for {context}: {e}")
-    
+    logger.error(f"All RPCs failed for {context} on {chain_id}")
     return [None] * len(payloads)
 
 async def process_balance_batch(session: aiohttp.ClientSession, 
                               checks: List[BalanceCheck], 
                               semaphore: asyncio.Semaphore) -> List[Tuple[str, str, float]]:
-    """Process a batch of balance checks for the same chain"""
+    """Process a batch of balance checks for the same chain with better error handling"""
     if not checks:
         return []
     
     async with semaphore:
         chain_id = checks[0].chain_id
-        rpc_urls = CHAINS[chain_id]['rpcs']
         results = []
         
         # Group by type (native vs ERC20)
@@ -219,25 +321,20 @@ async def process_balance_batch(session: aiohttp.ClientSession,
                     "id": i + 1
                 })
             
-            for rpc_url in rpc_urls:
-                native_responses = await make_batch_rpc_call(
-                    session, rpc_url, native_payloads, f"native batch on {chain_id}"
-                )
-                
-                success_count = 0
-                for check, response in zip(native_checks, native_responses):
-                    if response and 'result' in response:
-                        try:
-                            balance = int(response['result'], 16) / 10**18
-                            results.append((check.chain_id, check.symbol, balance))
-                            success_count += 1
-                        except (ValueError, TypeError):
-                            results.append((check.chain_id, check.symbol, 0.0))
-                    else:
+            native_responses = await make_batch_rpc_call_with_retry(
+                session, chain_id, native_payloads, f"native batch on {chain_id}"
+            )
+            
+            for check, response in zip(native_checks, native_responses):
+                if response and 'result' in response:
+                    try:
+                        balance = int(response['result'], 16) / 10**18
+                        results.append((check.chain_id, check.symbol, balance))
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Error parsing native balance for {check.address}: {e}")
                         results.append((check.chain_id, check.symbol, 0.0))
-                
-                if success_count == len(native_checks):
-                    break  # All succeeded, no need to try other RPCs
+                else:
+                    results.append((check.chain_id, check.symbol, 0.0))
         
         # Process ERC20 balances in batch
         if erc20_checks:
@@ -253,34 +350,29 @@ async def process_balance_batch(session: aiohttp.ClientSession,
                     "id": len(native_checks) + i + 1
                 })
             
-            for rpc_url in rpc_urls:
-                erc20_responses = await make_batch_rpc_call(
-                    session, rpc_url, erc20_payloads, f"ERC20 batch on {chain_id}"
-                )
-                
-                success_count = 0
-                for check, response in zip(erc20_checks, erc20_responses):
-                    if response and 'result' in response:
-                        try:
-                            balance_raw = int(response['result'], 16)
-                            # Fix BSC decimal issue - BSC stablecoins use 18 decimals
-                            decimals_key = f"{check.chain_id}_{check.symbol}" if check.chain_id == 'bsc' else check.symbol
-                            decimals = TOKEN_DECIMALS.get(decimals_key, 18)
-                            balance = balance_raw / (10 ** decimals)
-                            results.append((check.chain_id, check.symbol, balance))
-                            success_count += 1
-                        except (ValueError, TypeError):
-                            results.append((check.chain_id, check.symbol, 0.0))
-                    else:
+            erc20_responses = await make_batch_rpc_call_with_retry(
+                session, chain_id, erc20_payloads, f"ERC20 batch on {chain_id}"
+            )
+            
+            for check, response in zip(erc20_checks, erc20_responses):
+                if response and 'result' in response:
+                    try:
+                        balance_raw = int(response['result'], 16)
+                        # Fix BSC decimal issue - BSC stablecoins use 18 decimals
+                        decimals_key = f"{check.chain_id}_{check.symbol}" if check.chain_id == 'bsc' else check.symbol
+                        decimals = TOKEN_DECIMALS.get(decimals_key, 18)
+                        balance = balance_raw / (10 ** decimals)
+                        results.append((check.chain_id, check.symbol, balance))
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Error parsing ERC20 balance for {check.address}: {e}")
                         results.append((check.chain_id, check.symbol, 0.0))
-                
-                if success_count == len(erc20_checks):
-                    break  # All succeeded, no need to try other RPCs
+                else:
+                    results.append((check.chain_id, check.symbol, 0.0))
         
         return results
 
 async def get_all_asset_balances_optimized(session: aiohttp.ClientSession, addresses: List[str]) -> Dict:
-    """Optimized balance fetching with batching and parallel processing"""
+    """Optimized balance fetching with better resource management"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     
     # Generate all balance checks
@@ -324,8 +416,15 @@ async def get_all_asset_balances_optimized(session: aiohttp.ClientSession, addre
     
     logger.info(f"Processing {len(tasks)} batches across {len(chain_groups)} chains")
     
-    # Execute all batches concurrently
-    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Execute all batches concurrently with timeout
+    try:
+        batch_results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=30  # 30 second timeout for the entire operation
+        )
+    except asyncio.TimeoutError:
+        logger.error("Balance fetching timed out after 30 seconds")
+        return {}
     
     # Aggregate results
     aggregated = {}
@@ -351,10 +450,10 @@ async def get_all_asset_balances_optimized(session: aiohttp.ClientSession, addre
 # --- Address Parsing and ENS Resolution ---
 
 async def resolve_ens_to_address(session: aiohttp.ClientSession, name: str) -> str | None:
-    """Resolve ENS name to address with timeout"""
+    """Resolve ENS name to address with timeout and retry"""
     try:
         async with session.get(f"https://api.ensideas.com/ens/resolve/{name.lower()}", 
-                             timeout=5) as response:
+                             timeout=8) as response:
             if response.status == 200:
                 data = await response.json()
                 address = data.get("address")
@@ -390,16 +489,22 @@ async def parse_and_resolve_addresses(session: aiohttp.ClientSession, text: str)
     
     logger.info(f"Found {len(found_addresses)} addresses and {len(found_ens_names)} ENS names")
     
-    # Resolve ENS names concurrently
+    # Resolve ENS names concurrently with timeout
     if found_ens_names:
-        resolved_addresses = await asyncio.gather(
-            *(resolve_ens_to_address(session, name) for name in found_ens_names),
-            return_exceptions=True
-        )
-        
-        for addr in resolved_addresses:
-            if isinstance(addr, str) and addr:
-                found_addresses.add(addr.lower())
+        try:
+            resolved_addresses = await asyncio.wait_for(
+                asyncio.gather(
+                    *(resolve_ens_to_address(session, name) for name in found_ens_names),
+                    return_exceptions=True
+                ),
+                timeout=15  # 15 seconds for all ENS resolutions
+            )
+            
+            for addr in resolved_addresses:
+                if isinstance(addr, str) and addr:
+                    found_addresses.add(addr.lower())
+        except asyncio.TimeoutError:
+            logger.warning("ENS resolution timed out")
     
     final_addresses = list(found_addresses)
     logger.info(f"Final address list: {len(final_addresses)} addresses")
@@ -419,6 +524,7 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 /start - Show this help message
 /about - Info & support the creator
 /debug - Test RPC endpoint speeds (admin only)
+/health - Show system health status
 
 **Supported Chains:**
 • Ethereum Mainnet
@@ -440,7 +546,7 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 0x742d35Cc6634C0532925a3b8D5C9E49C7F59c2c4
 vitalik.eth
 
-⚡ **Now with lightning-fast batch processing!**
+⚡ **Now with intelligent RPC management and better reliability!**
 """
     await update.message.reply_text(welcome_message, parse_mode='Markdown', disable_web_page_preview=False)
 
@@ -448,61 +554,102 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     about_message = f"Tip Jar (ETH/EVM):\n`{TIP_ADDRESS}`"
     await update.message.reply_text(about_message, parse_mode='Markdown')
 
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show system health status"""
+    health_info = []
+    
+    # Check global session status
+    global global_session
+    if global_session and not global_session.closed:
+        health_info.append("✅ Global session: Active")
+    else:
+        health_info.append("❌ Global session: Inactive")
+    
+    # Check RPC health status
+    total_rpcs = 0
+    unhealthy_rpcs = 0
+    
+    for chain_id, chain_info in CHAINS.items():
+        healthy_count = 0
+        total_chain_rpcs = len(chain_info['rpcs'])
+        total_rpcs += total_chain_rpcs
+        
+        for rpc in chain_info['rpcs']:
+            if is_rpc_healthy(rpc):
+                healthy_count += 1
+            else:
+                unhealthy_rpcs += 1
+        
+        status = "✅" if healthy_count == total_chain_rpcs else "⚠️" if healthy_count > 0 else "❌"
+        health_info.append(f"{status} {chain_info['name']}: {healthy_count}/{total_chain_rpcs} RPCs healthy")
+    
+    # Overall health summary
+    healthy_rpcs = total_rpcs - unhealthy_rpcs
+    overall_health = "✅ Excellent" if unhealthy_rpcs == 0 else "⚠️ Degraded" if unhealthy_rpcs < total_rpcs * 0.3 else "❌ Poor"
+    
+    health_message = f"🏥 **System Health Status**\n\n"
+    health_message += f"**Overall Health:** {overall_health}\n"
+    health_message += f"**RPC Status:** {healthy_rpcs}/{total_rpcs} healthy\n\n"
+    health_message += "\n".join(health_info)
+    
+    if unhealthy_rpcs > 0:
+        health_message += f"\n\n💡 **Note:** Unhealthy RPCs will recover automatically after {RPC_FAILURE_COOLDOWN//60} minutes"
+    
+    await update.message.reply_text(health_message, parse_mode='Markdown')
+
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test RPC endpoint speeds for debugging"""
-    # You can restrict this to your user ID for security
-    # user_id = update.effective_user.id
-    # if user_id != YOUR_TELEGRAM_USER_ID:  # Replace with your actual user ID
-    #     await update.message.reply_text("❌ Debug command is admin-only.")
-    #     return
-    
     status_message = await update.message.reply_text("🔧 Testing RPC endpoint speeds...")
     
     test_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"  # Vitalik's address
     results = []
     
-    connector = aiohttp.TCPConnector(limit=20)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    session = await get_global_session()
+    
+    for chain_id, chain_info in CHAINS.items():
+        chain_results = []
+        healthy_rpcs = get_healthy_rpcs(chain_id)
         
-        for chain_id, chain_info in CHAINS.items():
-            chain_results = []
+        for rpc_url in healthy_rpcs[:3]:  # Test first 3 healthy RPCs per chain
+            start_time = asyncio.get_event_loop().time()
             
-            for rpc_url in chain_info['rpcs'][:2]:  # Test first 2 RPCs per chain
-                start_time = asyncio.get_event_loop().time()
-                
-                payload = {
-                    "jsonrpc": "2.0",
-                    "method": "eth_getBalance", 
-                    "params": [test_address, "latest"],
-                    "id": 1
-                }
-                
-                try:
-                    async with session.post(rpc_url, json=payload, timeout=10) as response:
-                        end_time = asyncio.get_event_loop().time()
-                        response_time = end_time - start_time
-                        
-                        if response.status == 200:
-                            data = await response.json()
-                            if 'result' in data:
-                                status = f"✅ {response_time:.2f}s"
-                            else:
-                                status = f"❌ RPC Error {response_time:.2f}s"
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_getBalance", 
+                "params": [test_address, "latest"],
+                "id": 1
+            }
+            
+            try:
+                async with session.post(rpc_url, json=payload, timeout=10) as response:
+                    end_time = asyncio.get_event_loop().time()
+                    response_time = end_time - start_time
+                    
+                    if response.status == 200:
+                        data = await response.json()
+                        if 'result' in data:
+                            status = f"✅ {response_time:.2f}s"
                         else:
-                            status = f"❌ HTTP {response.status} {response_time:.2f}s"
+                            status = f"❌ RPC Error {response_time:.2f}s"
+                    else:
+                        status = f"❌ HTTP {response.status} {response_time:.2f}s"
                             
-                except asyncio.TimeoutError:
-                    status = "⏰ Timeout >10s"
-                except Exception as e:
-                    status = f"❌ Error: {str(e)[:20]}"
-                
-                rpc_name = rpc_url.split('//')[1].split('/')[0]
-                chain_results.append(f"  {rpc_name}: {status}")
+            except asyncio.TimeoutError:
+                status = "⏰ Timeout >10s"
+            except Exception as e:
+                status = f"❌ Error: {str(e)[:20]}"
             
-            results.append(f"**{chain_info['name']}:**\n" + "\n".join(chain_results))
+            rpc_name = rpc_url.split('//')[1].split('/')[0]
+            
+            # Add health status
+            health_status = "🟢" if is_rpc_healthy(rpc_url) else "🔴"
+            chain_results.append(f"  {health_status} {rpc_name}: {status}")
+        
+        results.append(f"**{chain_info['name']}:**\n" + "\n".join(chain_results))
     
     debug_message = "🔧 **RPC Endpoint Speed Test:**\n\n" + "\n\n".join(results)
-    debug_message += f"\n\n💡 **Analysis:** Look for endpoints consistently >3s or with errors."
+    debug_message += f"\n\n💡 **Legend:**\n🟢 = Healthy RPC\n🔴 = Recently failed RPC"
+    debug_message += f"\n\n**Analysis:** Look for endpoints consistently >3s or with errors."
     
     await status_message.edit_text(debug_message, parse_mode='Markdown')
 
@@ -510,11 +657,11 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     current_time = time.time()
     
-    # Rate limiting: max 1 request per 10 seconds per user
+    # Rate limiting: max 1 request per 15 seconds per user (increased from 10)
     if user_id in user_last_request:
         time_since_last = current_time - user_last_request[user_id]
-        if time_since_last < 10:
-            await update.message.reply_text(f"⏳ Please wait {10 - int(time_since_last)} seconds before your next request.")
+        if time_since_last < 15:
+            await update.message.reply_text(f"⏳ Please wait {15 - int(time_since_last)} seconds before your next request.")
             return
     
     # Check concurrent requests for this user
@@ -529,32 +676,33 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start_time = asyncio.get_event_loop().time()
         status_message = await update.message.reply_text("🔍 Resolving addresses...")
         
-        # Use smaller connection pool under load
-        connector = aiohttp.TCPConnector(
-            limit=50,  # Reduced from 100
-            ttl_dns_cache=300, 
-            use_dns_cache=True,
-            keepalive_timeout=15  # Shorter keepalive
-        )
+        # Use the global session
+        session = await get_global_session()
         
-        async with aiohttp.ClientSession(connector=connector) as session:
-            # Parse and resolve addresses
-            addresses = await parse_and_resolve_addresses(session, update.message.text)
-            if not addresses:
-                await status_message.edit_text("❌ I didn't find any valid addresses or `.eth` names.")
-                return
+        # Parse and resolve addresses
+        addresses = await parse_and_resolve_addresses(session, update.message.text)
+        if not addresses:
+            await status_message.edit_text("❌ I didn't find any valid addresses or `.eth` names.")
+            return
 
-            if len(addresses) > 200:
-                await status_message.edit_text("❌ Too many addresses! Please limit to 200 addresses maximum.")
-                return
+        if len(addresses) > 200:
+            await status_message.edit_text("❌ Too many addresses! Please limit to 200 addresses maximum.")
+            return
 
-            await status_message.edit_text(f"✅ Found {len(addresses)} unique address(es).\n⚡ Fetching all balances with optimized batch processing...")
-            
-            # Get balances and ETH price concurrently
-            balance_task = get_all_asset_balances_optimized(session, addresses)
-            price_task = get_eth_price(session)
-            
-            aggregated_balances, eth_price = await asyncio.gather(balance_task, price_task)
+        await status_message.edit_text(f"✅ Found {len(addresses)} unique address(es).\n⚡ Fetching all balances with intelligent RPC management...")
+        
+        # Get balances and ETH price concurrently
+        balance_task = get_all_asset_balances_optimized(session, addresses)
+        price_task = get_eth_price(session)
+        
+        try:
+            aggregated_balances, eth_price = await asyncio.wait_for(
+                asyncio.gather(balance_task, price_task),
+                timeout=45  # 45 second timeout for entire operation
+            )
+        except asyncio.TimeoutError:
+            await status_message.edit_text("⏰ Request timed out. The RPCs might be slow right now. Please try again in a few minutes.")
+            return
 
         if not aggregated_balances:
             await status_message.edit_text("❌ No balances found for the provided addresses.")
@@ -650,6 +798,10 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         final_message += f"\n✅ Found balances on {total_chains_with_balances} chain(s)"
         
+        # Add performance note if slow
+        if execution_time > 10:
+            final_message += f"\n⚠️ Response was slower than usual due to RPC limitations"
+        
         await status_message.edit_text(final_message, parse_mode='Markdown', disable_web_page_preview=True)
         
         # Log summary for debugging
@@ -658,7 +810,18 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error in balance_command for user {user_id}: {e}", exc_info=True)
-        await status_message.edit_text(f"❌ An error occurred while fetching balances. Please try again.\n\nError: {str(e)[:100]}")
+        error_message = "❌ An error occurred while fetching balances. Please try again."
+        
+        # Add specific error info for debugging if it's a known issue
+        if "timeout" in str(e).lower():
+            error_message += "\n⏰ This appears to be a timeout. RPCs might be slow right now."
+        elif "rate" in str(e).lower() or "429" in str(e):
+            error_message += "\n⚠️ Rate limited. Please wait a few minutes before trying again."
+        
+        try:
+            await status_message.edit_text(error_message)
+        except:
+            await update.message.reply_text(error_message)
     
     finally:
         # Always decrement active requests counter
@@ -672,22 +835,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         yield
         return
         
+    # Initialize global session
+    await get_global_session()
+    
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("about", about_command))
     application.add_handler(CommandHandler("debug", debug_command))
+    application.add_handler(CommandHandler("health", health_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, balance_command))
     
     await application.initialize()
     await application.start()
     await application.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram bot started successfully.")
+    logger.info("Telegram bot started successfully with optimized session management.")
     
     yield
     
+    # Cleanup
     await application.updater.stop()
     await application.stop()
     await application.shutdown()
+    
+    # Close global session
+    global global_session
+    if global_session and not global_session.closed:
+        await global_session.close()
+        logger.info("Global session closed.")
+    
     logger.info("Telegram bot has been shut down.")
 
 web_app = FastAPI(lifespan=lifespan)
