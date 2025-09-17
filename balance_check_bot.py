@@ -31,10 +31,10 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
 # --- Bot Configuration ---
 TIP_ADDRESS = "0x50A0d7Fb9f64e908688443cB94c3971705599d79"
-MAX_CONCURRENT_REQUESTS = 12
-REQUEST_TIMEOUT = 8
-MAX_RETRIES = 3  # Increased retries for better reliability
-BATCH_SIZE = 6
+MAX_CONCURRENT_REQUESTS = 8  # Reduced for better reliability
+REQUEST_TIMEOUT = 10
+MAX_RETRIES = 3
+BATCH_SIZE = 4  # Smaller batches for better accuracy
 USER_RATE_LIMIT = 2
 RPC_FAILURE_COOLDOWN = 300
 
@@ -49,8 +49,8 @@ TOKEN_DECIMALS = {
     'bsc_USDT': 18,
     'bsc_USDC': 18,
     # Hyperliquid EVM tokens
-    'WHYPE': 18,  # Wrapped HYPE uses 18 decimals
-    'stHYPE': 18,  # Staked HYPE uses 18 decimals
+    'WHYPE': 18,
+    'stHYPE': 18,
 }
 
 @dataclass
@@ -137,7 +137,6 @@ CHAINS = {
         'symbol': 'HYPE', 
         'rpcs': [
             'https://rpc.hyperliquid.xyz/evm',
-            # Can add more RPCs from providers like Chainstack if needed
         ]
     },
     'ink': {
@@ -165,8 +164,8 @@ ERC20_CONTRACTS = {
     'polygon': {'USDC': '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', 'USDT': '0xc2132D05D31c914a87C6611C10748AEb04B58e8F'},
     'bsc': {'USDT': '0x55d398326f99059ff775485246999027b3197955', 'USDC': '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d'},
     'hyperliquid': {
-        'WHYPE': '0x5555555555555555555555555555555555555555',  # Wrapped HYPE
-        'stHYPE': '0xffaa4a3d97fe9107cef8a3f48c069f577ff76cc1'  # Staked HYPE
+        'WHYPE': '0x5555555555555555555555555555555555555555',
+        'stHYPE': '0xffaa4a3d97fe9107cef8a3f48c069f577ff76cc1'
     },
     'ink': {'USDT': '0x0200C29006150606B650577BBE7B6248F58470c1'},
     'unichain': {'USDT': '0x9151434b16b9763660705744891fA906F660EcC5'},
@@ -351,20 +350,21 @@ def parse_balance_result(result_hex: str, decimals: int = 18) -> float:
 
 async def process_balance_batch(session: aiohttp.ClientSession, 
                               checks: List[BalanceCheck], 
-                              semaphore: asyncio.Semaphore) -> List[Tuple[str, str, float]]:
-    """Process a batch of balance checks for the same chain with better error handling"""
+                              semaphore: asyncio.Semaphore) -> Dict[str, Dict[str, float]]:
+    """Process a batch of balance checks for the same chain with proper address tracking"""
     if not checks:
-        return []
+        return {}
     
     async with semaphore:
         chain_id = checks[0].chain_id
-        results = []
+        # Use a dict keyed by address to prevent cross-contamination
+        address_balances = defaultdict(lambda: defaultdict(float))
         
         # Group by type (native vs ERC20)
         native_checks = [c for c in checks if c.is_native]
         erc20_checks = [c for c in checks if not c.is_native]
         
-        # Process native balances in batch
+        # Process native balances
         if native_checks:
             native_payloads = []
             for i, check in enumerate(native_checks):
@@ -379,30 +379,15 @@ async def process_balance_batch(session: aiohttp.ClientSession,
                 session, chain_id, native_payloads, f"native batch on {chain_id}"
             )
             
+            # Map responses to specific addresses
             for check, response in zip(native_checks, native_responses):
                 if response and 'result' in response:
                     balance = parse_balance_result(response['result'], 18)
-                    results.append((check.chain_id, check.symbol, balance))
-                else:
-                    # For failed native balance checks, try individual retry
-                    logger.warning(f"Native balance check failed for {check.address} on {chain_id}, retrying individually")
-                    individual_response = await make_batch_rpc_call_with_retry(
-                        session, chain_id, 
-                        [{
-                            "jsonrpc": "2.0",
-                            "method": "eth_getBalance",
-                            "params": [check.address, "latest"],
-                            "id": 1
-                        }],
-                        f"individual native for {check.address[:10]}... on {chain_id}"
-                    )
-                    if individual_response[0] and 'result' in individual_response[0]:
-                        balance = parse_balance_result(individual_response[0]['result'], 18)
-                        results.append((check.chain_id, check.symbol, balance))
-                    else:
-                        results.append((check.chain_id, check.symbol, 0.0))
+                    if balance > 0.000001:  # Filter dust
+                        address_balances[check.address][check.symbol] = balance
+                        logger.debug(f"Found {balance} {check.symbol} for {check.address[:10]}... on {chain_id}")
         
-        # Process ERC20 balances in batch
+        # Process ERC20 balances
         if erc20_checks:
             erc20_payloads = []
             for i, check in enumerate(erc20_checks):
@@ -420,76 +405,29 @@ async def process_balance_batch(session: aiohttp.ClientSession,
                 session, chain_id, erc20_payloads, f"ERC20 batch on {chain_id}"
             )
             
+            # Map responses to specific addresses
             for check, response in zip(erc20_checks, erc20_responses):
                 if response and 'result' in response:
                     # Fix for BSC decimal issue
                     decimals_key = f"{check.chain_id}_{check.symbol}" if check.chain_id == 'bsc' else check.symbol
                     decimals = TOKEN_DECIMALS.get(decimals_key, 18)
                     balance = parse_balance_result(response['result'], decimals)
-                    results.append((check.chain_id, check.symbol, balance))
-                else:
-                    results.append((check.chain_id, check.symbol, 0.0))
+                    if balance > 0.000001:  # Filter dust
+                        address_balances[check.address][check.symbol] = balance
+                        logger.debug(f"Found {balance} {check.symbol} for {check.address[:10]}... on {chain_id}")
         
-        return results
-
-async def verify_critical_balances(session: aiohttp.ClientSession, addresses: List[str], 
-                                  initial_balances: Dict) -> Dict:
-    """Re-verify balances for critical chains like Base with more robust checking"""
-    logger.info("Running verification pass for critical chains...")
-    
-    critical_chains = ['base', 'ethereum', 'arbitrum', 'hyperliquid']  # Added Hyperliquid to critical chains
-    verification_checks = []
-    
-    for addr in addresses:
-        for chain_id in critical_chains:
-            if chain_id in CHAINS:
-                verification_checks.append(BalanceCheck(
-                    chain_id=chain_id,
-                    address=addr,
-                    symbol=CHAINS[chain_id]['symbol'],
-                    is_native=True
-                ))
-    
-    # Use a smaller batch size for verification
-    semaphore = asyncio.Semaphore(6)
-    tasks = []
-    
-    for i in range(0, len(verification_checks), 2):  # Smaller batches of 2
-        batch = verification_checks[i:i + 2]
-        tasks.append(process_balance_batch(session, batch, semaphore))
-    
-    try:
-        batch_results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True),
-            timeout=20
-        )
+        # Aggregate balances by chain and token
+        chain_aggregated = defaultdict(float)
+        for addr_tokens in address_balances.values():
+            for symbol, balance in addr_tokens.items():
+                chain_aggregated[symbol] += balance
         
-        # Compare and update with verified results
-        verified_balances = initial_balances.copy()
-        
-        for batch_result in batch_results:
-            if isinstance(batch_result, Exception):
-                continue
-                
-            for chain_id, symbol, balance in batch_result:
-                if balance > 0.000001:  # Only update if we found a non-zero balance
-                    if chain_id not in verified_balances:
-                        verified_balances[chain_id] = {}
-                    
-                    # Take the maximum of initial and verified balance
-                    current = verified_balances[chain_id].get(symbol, 0)
-                    if balance > current:
-                        logger.info(f"Updated {chain_id} {symbol} balance from {current} to {balance}")
-                        verified_balances[chain_id][symbol] = balance
-        
-        return verified_balances
-        
-    except asyncio.TimeoutError:
-        logger.warning("Verification pass timed out, using initial results")
-        return initial_balances
+        if chain_aggregated:
+            return {chain_id: dict(chain_aggregated)}
+        return {}
 
 async def get_all_asset_balances_optimized(session: aiohttp.ClientSession, addresses: List[str]) -> Dict:
-    """Optimized balance fetching with verification pass"""
+    """Optimized balance fetching without problematic verification pass"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     
     # Generate all balance checks
@@ -523,10 +461,10 @@ async def get_all_asset_balances_optimized(session: aiohttp.ClientSession, addre
     for check in all_checks:
         chain_groups[check.chain_id].append(check)
     
-    # Process each chain's checks in batches
+    # Process each chain's checks in smaller, more reliable batches
     tasks = []
     for chain_id, checks in chain_groups.items():
-        # Split into smaller batches
+        # Use smaller batch sizes for better accuracy
         for i in range(0, len(checks), BATCH_SIZE):
             batch = checks[i:i + BATCH_SIZE]
             tasks.append(process_balance_batch(session, batch, semaphore))
@@ -543,7 +481,7 @@ async def get_all_asset_balances_optimized(session: aiohttp.ClientSession, addre
         logger.error("Balance fetching timed out after 30 seconds")
         return {}
     
-    # Aggregate results
+    # Aggregate results - properly merge chain results
     aggregated = {}
     total_balances = 0
     
@@ -551,22 +489,26 @@ async def get_all_asset_balances_optimized(session: aiohttp.ClientSession, addre
         if isinstance(batch_result, Exception):
             logger.error(f"Batch failed: {batch_result}")
             continue
-            
-        for chain_id, symbol, balance in batch_result:
-            if balance and balance > 0.000001:  # Filter out dust
+        
+        if isinstance(batch_result, dict):
+            for chain_id, tokens in batch_result.items():
                 if chain_id not in aggregated:
                     aggregated[chain_id] = {}
-                if symbol not in aggregated[chain_id]:
-                    aggregated[chain_id][symbol] = 0
-                aggregated[chain_id][symbol] += balance
-                total_balances += 1
+                for symbol, balance in tokens.items():
+                    if symbol not in aggregated[chain_id]:
+                        aggregated[chain_id][symbol] = 0
+                    aggregated[chain_id][symbol] += balance
+                    total_balances += 1
     
-    logger.info(f"Initial pass found {total_balances} non-zero balances across {len(aggregated)} chains")
+    # Log final balances for debugging
+    for chain_id, tokens in aggregated.items():
+        for symbol, balance in tokens.items():
+            if balance > 0.000001:
+                logger.info(f"Final balance: {chain_id} - {symbol}: {balance}")
     
-    # Run verification pass for critical chains
-    verified_balances = await verify_critical_balances(session, addresses, aggregated)
+    logger.info(f"Found {total_balances} non-zero balances across {len(aggregated)} chains")
     
-    return verified_balances
+    return aggregated
 
 # --- Address Parsing and ENS Resolution ---
 
@@ -632,7 +574,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_url = "https://i.ibb.co/qMZjmJ9V/eth2.png"
     welcome_message = f"[​]({image_url})"
     welcome_message += """
-    🤖 **Crypto Balance Bot** ⚡
+🤖 **Crypto Balance Bot** ⚡
 
 I'll help you check native and stablecoin balances across multiple EVM chains! I also resolve `.eth` names.
 
@@ -798,7 +740,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_message.edit_text("❌ Too many addresses! Please limit to 200 addresses maximum.")
             return
 
-        await status_message.edit_text(f"✅ Found {len(addresses)} unique address(es).\n⚡ Fetching balances with verification pass...")
+        await status_message.edit_text(f"✅ Found {len(addresses)} unique address(es).\n⚡ Fetching balances...")
         
         balance_task = get_all_asset_balances_optimized(session, addresses)
         price_task = get_eth_price(session)
@@ -939,7 +881,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await application.initialize()
     await application.start()
     await application.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram bot started successfully with enhanced reliability.")
+    logger.info("Telegram bot started successfully with fixed balance counting.")
     
     yield
     
