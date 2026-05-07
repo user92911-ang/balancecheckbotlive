@@ -51,8 +51,8 @@ TOKEN_DECIMALS = {
     # Hyperliquid EVM tokens
     'WHYPE': 18,
     'stHYPE': 18,
-    # MegaETH tokens
-    'USDm': 18,
+    # Ethereum Mainnet tokens
+    'JIFF': 18,
 }
 
 @dataclass
@@ -156,18 +156,10 @@ CHAINS = {
         'symbol': 'ETH', 
         'rpcs': ['https://api.mainnet.abs.xyz']
     },
-    'megaeth': {
-        'name': 'MegaETH',
-        'symbol': 'ETH',
-        'rpcs': [
-            'https://mainnet.megaeth.com/rpc',
-            'https://carrot.megaeth.com',
-        ]
-    },
 }
 
 ERC20_CONTRACTS = {
-    'ethereum': {'USDT': '0xdac17f958d2ee523a2206206994597c13d831ec7', 'USDC': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'},
+    'ethereum': {'USDT': '0xdac17f958d2ee523a2206206994597c13d831ec7', 'USDC': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'JIFF': '0xf12DDD4688c7B710a6F7e2d30cFE6C72D98853d1'},
     'base': {'USDT': '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2', 'USDC': '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'},
     'arbitrum': {'USDC': '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', 'USDT': '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9'},
     'optimism': {'USDC': '0x0b2c639c533813f4aa9d7837caf62653d097ff85', 'USDT': '0x94b008aa00579c1307b0ef2c499ad98a8ce58e58'},
@@ -180,9 +172,6 @@ ERC20_CONTRACTS = {
     'ink': {'USDT': '0x0200C29006150606B650577BBE7B6248F58470c1'},
     'unichain': {'USDT': '0x9151434b16b9763660705744891fA906F660EcC5'},
     'abstract': {'USDC': '0x07865c6E87B9F70255377e024ace6630C1Eaa37F', 'USDT': '0x0200C29006150606B650577BBE7B6248F58470c1'},
-    'megaeth': {
-        'USDm': '0xfafddbb3fc7688494971a79cc65dca3ef82079e7',
-    },
 }
 
 class BalanceFetchError(Exception):
@@ -543,7 +532,7 @@ async def resolve_ens_to_address(session: aiohttp.ClientSession, name: str) -> s
 async def parse_and_resolve_addresses(session: aiohttp.ClientSession, text: str) -> List[str]:
     """Parse and resolve addresses with improved validation and common address formats"""
     address_pattern = r'0x[a-fA-F0-9]{40}'
-    ens_pattern = r'\b[a-zA-Z0-9-]+\.eth\b'
+    ens_pattern = r'[a-zA-Z0-9-]+\.eth'
     
     context_address_pattern = r'(?:address|wallet|addr|account)[:=\s]+0x[a-fA-F0-9]{40}'
     
@@ -608,7 +597,6 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 • Polygon
 • Optimism
 • BSC
-• MegaETH (ETH + USDm)
 
 **Usage:**
 1. Paste your wallet addresses or `.eth` names.
@@ -619,7 +607,7 @@ I'll help you check native and stablecoin balances across multiple EVM chains! I
 0x742d35Cc6634C0532925a3b8D5C9E49C7F59c2c4
 vitalik.eth
 
-⚡ **Now checking Hyperliquid EVM for HYPE and MegaETH for ETH + USDm!**
+⚡ **Now checking Hyperliquid EVM for HYPE balances!**
 """
     await update.message.reply_text(welcome_message, parse_mode='Markdown', disable_web_page_preview=False)
 
@@ -681,7 +669,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         healthy_rpcs = get_healthy_rpcs(chain_id)
         
         for rpc_url in healthy_rpcs[:3]:
-            start_time = asyncio.get_running_loop().time()
+            start_time = asyncio.get_event_loop().time()
             
             payload = {
                 "jsonrpc": "2.0",
@@ -692,7 +680,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             try:
                 async with session.post(rpc_url, json=payload, timeout=10) as response:
-                    end_time = asyncio.get_running_loop().time()
+                    end_time = asyncio.get_event_loop().time()
                     response_time = end_time - start_time
                     
                     if response.status == 200:
@@ -739,9 +727,8 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_last_request[user_id] = current_time
     active_user_requests[user_id] += 1
     
-    status_message = None  # Initialise early so the except block can always reference it
     try:
-        start_time = asyncio.get_running_loop().time()
+        start_time = asyncio.get_event_loop().time()
         status_message = await update.message.reply_text("🔍 Resolving addresses...")
         
         session = await get_global_session()
@@ -782,7 +769,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     grand_totals[symbol] = 0
                 grand_totals[symbol] += balance
 
-        execution_time = asyncio.get_running_loop().time() - start_time
+        execution_time = asyncio.get_event_loop().time() - start_time
         final_message = f"📊 **Balance Summary for {len(addresses)} address(es)** (⚡ {execution_time:.1f}s)\n\n"
         
         chain_items = list(aggregated_balances.items())
@@ -791,7 +778,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 -x[1].get('ETH', 0),
                 x[0]
             ))
-        except Exception:
+        except:
             chain_items.sort()
         
         for chain_id, tokens in chain_items:
@@ -800,13 +787,13 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             token_items = list(tokens.items())
             token_items.sort(key=lambda x: (
-                0 if x[0] in ['ETH'] else 1 if x[0] in ['USDC', 'USDT', 'USDm'] else 2,
+                0 if x[0] in ['ETH'] else 1 if x[0] in ['USDC', 'USDT'] else 2,
                 -x[1]
             ))
             
             for symbol, balance in token_items:
                 if balance >= 0.000001:
-                    if symbol in ['USDC', 'USDT', 'USDm']:
+                    if symbol in ['USDC', 'USDT']:
                         formatted_balance = f"{balance:,.2f}"
                     elif symbol in ['ETH', 'BNB', 'MATIC', 'HYPE']:
                         formatted_balance = f"{balance:,.6f}".rstrip('0').rstrip('.')
@@ -823,13 +810,13 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             total_items = list(grand_totals.items())
             total_items.sort(key=lambda x: (
-                0 if x[0] in ['ETH'] else 1 if x[0] in ['USDC', 'USDT', 'USDm'] else 2,
+                0 if x[0] in ['ETH'] else 1 if x[0] in ['USDC', 'USDT'] else 2,
                 -x[1]
             ))
             
             for symbol, total in total_items:
                 if total >= 0.000001:
-                    if symbol in ['USDC', 'USDT', 'USDm']:
+                    if symbol in ['USDC', 'USDT']:
                         formatted_total = f"{total:,.2f}"
                     else:
                         formatted_total = f"{total:,.6f}".rstrip('0').rstrip('.')
@@ -841,8 +828,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 portfolio_usd += eth_usd
                 final_message += f"\n💰 **ETH Value:** `${eth_usd:,.2f}` (@ `${eth_price:,.2f}/ETH`)\n"
             
-            stablecoin_total = (grand_totals.get('USDC', 0) + grand_totals.get('USDT', 0)
-                                + grand_totals.get('USDm', 0))
+            stablecoin_total = grand_totals.get('USDC', 0) + grand_totals.get('USDT', 0)
             if stablecoin_total > 0:
                 portfolio_usd += stablecoin_total
                 final_message += f"💵 **Stablecoin Value:** `${stablecoin_total:,.2f}`\n"
@@ -870,11 +856,8 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             error_message += "\n⚠️ Rate limited. Please wait a few minutes before trying again."
         
         try:
-            if status_message is not None:
-                await status_message.edit_text(error_message)
-            else:
-                await update.message.reply_text(error_message)
-        except Exception:
+            await status_message.edit_text(error_message)
+        except:
             await update.message.reply_text(error_message)
     
     finally:
